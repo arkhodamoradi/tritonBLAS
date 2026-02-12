@@ -1,3 +1,4 @@
+
 import triton
 import triton.language as tl
 import torch
@@ -7,17 +8,17 @@ import numpy as np
 @triton.jit
 def mxfp8_dot_scaled_gemm(
     A_ptr, B_ptr, C_ptr,
-    As_ptr_32, Bs_ptr_32,                       # e8m0 scales (uint8)
+    As_ptr, Bs_ptr,                       # e8m0 scales (uint8)
     M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
 
     stride_am: tl.constexpr, stride_ak: tl.constexpr,
     stride_bn: tl.constexpr, stride_bk: tl.constexpr,
     stride_cm: tl.constexpr, stride_cn: tl.constexpr,
 
-    # As: [M, K//128]
-    stride_asm_32: tl.constexpr, stride_askg_32: tl.constexpr,
-    # Bs: [N, K//128]  (IMPORTANT: indexed by N, then K-group)
-    stride_bsn_32: tl.constexpr, stride_bskg_32: tl.constexpr,
+    # As: [M, K//32]
+    stride_asm: tl.constexpr, stride_askg: tl.constexpr,
+    # Bs: [N, K//32]  (IMPORTANT: indexed by N, then K-group)
+    stride_bsn: tl.constexpr, stride_bskg: tl.constexpr,
 
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr = 8,
@@ -27,12 +28,8 @@ def mxfp8_dot_scaled_gemm(
 ):
     # dot_scaled for MX formats uses group_size=32 for e8m0 scales
     GROUP_SIZE: tl.constexpr = 32
-    K_PER_U32: tl.constexpr = 128
-    GROUPS_PER_U32: tl.constexpr = 4  # 4 bytes per u32
-
-    tl.static_assert(K % K_PER_U32 == 0, "K must be multiple of 128 for packed u32 scales (K%128==0)")
-    tl.static_assert(BLOCK_K % K_PER_U32 == 0, "BLOCK_K must be multiple of 128 for packed u32 scales")
-    tl.static_assert(BLOCK_K % GROUP_SIZE == 0, "BLOCK_K must be multiple of 32")
+    tl.static_assert(BLOCK_K % GROUP_SIZE == 0, "BLOCK_K must be multiple of 32 for e8m0 scales")
+    tl.static_assert(K % GROUP_SIZE == 0, "K must be multiple of 32 for e8m0 scales (MXFP8)")
 
     pid = tl.program_id(0)
     grid_m = tl.cdiv(M, BLOCK_M)
@@ -70,48 +67,30 @@ def mxfp8_dot_scaled_gemm(
         )
 
         # ----- load e8m0 scales (uint8) -----
-        #u0 = k0 // K_PER_U32                         # base u32 scale index along K
-        #u_cols = tl.arange(0, BLOCK_K // K_PER_U32)  # [BK/128]
+        kg0 = (k0 // GROUP_SIZE)
+        kgs = tl.arange(0, BLOCK_K // GROUP_SIZE)  # 0..(BK/32-1)
 
-        g = tl.arange(0, BLOCK_K // GROUP_SIZE)        
-        u_col = g // GROUPS_PER_U32                    
-        lane  = g % GROUPS_PER_U32
-
-        u0 = k0 // K_PER_U32                         # scalar base index into packed-u32 K dim
-        u32_idx = u0 + u_col                         # [BK/32] packed-u32 index for each 32-wide group
-
+        as_ptrs = As_ptr + offs_m[:, None] * stride_asm + (kg0 + kgs)[None, :] * stride_askg
+        tl.max_contiguous(kgs, 16)
+        tl.multiple_of(kg0, 16)
+        tl.multiple_of(as_ptrs, (1,16))
         # As: [BM, BK/32]
-        a_scale_32 = tl.load(
-            As_ptr_32 + offs_m[:, None] * stride_asm_32 + u32_idx[None, :] * stride_askg_32,
+        a_scale = tl.load(
+            as_ptrs,
             mask=(offs_m[:, None] < M),
             other=0,
-        ).to(tl.int32)
+        )
 
+        bs_ptrs = Bs_ptr + offs_n[:, None] * stride_bsn + (kg0 + kgs)[None, :] * stride_bskg
+        tl.max_contiguous(kgs, 16)
+        tl.multiple_of(kg0, 16)
+        tl.multiple_of(bs_ptrs, (1,16))
         # Bs: [BN, BK/32]  (IMPORTANT: Bs is indexed by N then K-group; do NOT transpose)
-        b_scale_32 = tl.load(
-            Bs_ptr_32 + offs_n[:, None] * stride_bsn_32 + u32_idx[None, :] * stride_bskg_32,
+        b_scale = tl.load(
+            bs_ptrs,
             mask=(offs_n[:, None] < N),
             other=0,
-        ).to(tl.int32)
-
-        # ---- Unpack u32 -> 4x uint8 lanes ----
-        a0 = (a_scale_32 & 0xFF).to(tl.uint8)
-        a1 = ((a_scale_32 // 256) & 0xFF).to(tl.uint8)
-        a2 = ((a_scale_32 // 65536) & 0xFF).to(tl.uint8)
-        a3 = ((a_scale_32 // 16777216) & 0xFF).to(tl.uint8)
-
-        b0 = (b_scale_32 & 0xFF).to(tl.uint8)
-        b1 = ((b_scale_32 // 256) & 0xFF).to(tl.uint8)
-        b2 = ((b_scale_32 // 65536) & 0xFF).to(tl.uint8)
-        b3 = ((b_scale_32 // 16777216) & 0xFF).to(tl.uint8)
-
-        a_scale = tl.where(lane[None, :] == 0, a0,
-                  tl.where(lane[None, :] == 1, a1,
-                  tl.where(lane[None, :] == 2, a2, a3)))
-
-        b_scale = tl.where(lane[None, :] == 0, b0,
-                  tl.where(lane[None, :] == 1, b1,
-                  tl.where(lane[None, :] == 2, b2, b3)))
+        )
 
         # ----- scaled dot (native MX path when supported) -----
         acc = tl.dot_scaled(
@@ -127,22 +106,6 @@ def mxfp8_dot_scaled_gemm(
         acc.to(OUT_DTYPE),
         mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
     )
-
-def pack_scales_u8_to_u32(scales_u8: torch.Tensor) -> torch.Tensor:
-    """
-    Pack uint8 scales along the last dimension in groups of 4 into uint32.
-
-    Input:  scales_u8 [..., G]  where G = K//32
-    Output: scales_u32 [..., G//4] where each uint32 packs 4 bytes:
-            out[..., t] = b0 | (b1<<8) | (b2<<16) | (b3<<24)
-            with b_i = scales_u8[..., 4t + i]
-    """
-    assert scales_u8.dtype == torch.uint8
-    G = scales_u8.shape[-1]
-    assert G % 4 == 0, f"Last dim (K//32={G}) must be divisible by 4 to pack into u32"
-    x = scales_u8.view(*scales_u8.shape[:-1], G // 4, 4).to(torch.int32)
-    out = x[..., 0] + (x[..., 1] * 256) | (x[..., 2] * 65536) | (x[..., 3] * 16777216)
-    return out.contiguous()
 
 def mxfp6fp8_gemm(_A, _B, As, Bs,
               BM=128, BN=128, BK=128,
@@ -167,26 +130,24 @@ def mxfp6fp8_gemm(_A, _B, As, Bs,
     M, K = A.shape
     N, K2 = B.shape
     assert K == K2
-    assert K % 128 == 0, "K must be multiple of 128 for packed-u32 scales path"
-    assert BK % 128 == 0, "BLOCK_K must be multiple of 128 for packed-u32 scales path"
     assert As.shape == (M, K//32)
     assert Bs.shape == (N, K//32)
     assert As.dtype == torch.uint8 and Bs.dtype == torch.uint8
 
-    As_32 = pack_scales_u8_to_u32(As)
-    Bs_32 = pack_scales_u8_to_u32(Bs)
-
     C = torch.empty((M, N), device=A.device, dtype=out_dtype)
     grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN),)
 
+    As = As.contiguous()
+    Bs = Bs.contiguous()
+
     mxfp8_dot_scaled_gemm[grid](
-        A, B, C, As_32, Bs_32,
+        A, B, C, As, Bs,
         M, N, K,
         A.stride(0), A.stride(1),
         B.stride(0), B.stride(1),
         C.stride(0), C.stride(1),
-        As_32.stride(0), As_32.stride(1),
-        Bs_32.stride(0), Bs_32.stride(1),
+        As.stride(0), As.stride(1),
+        Bs.stride(0), Bs.stride(1),
         BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
         GROUP_M=group_m,
         A_FMT=afmt, B_FMT=bfmt,
