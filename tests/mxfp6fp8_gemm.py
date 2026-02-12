@@ -49,7 +49,12 @@ def mxfp8_dot_scaled_gemm(
 
     # iterate over K tiles
     for k0 in range(0, K, BLOCK_K):
+        tl.multiple_of(k0, 512)
         offs_k = k0 + tl.arange(0, BLOCK_K)
+        offs_kg = (k0 // GROUP_SIZE) + tl.arange(0, BLOCK_K // GROUP_SIZE)
+        tl.max_contiguous(offs_kg, 16)
+        #tl.multiple_of(stride_askg, 1)
+        #tl.multiple_of(stride_bskg, 1)
 
         # ----- load FP8 tiles -----
         # A: [BM, BK]
@@ -67,28 +72,17 @@ def mxfp8_dot_scaled_gemm(
         )
 
         # ----- load e8m0 scales (uint8) -----
-        kg0 = (k0 // GROUP_SIZE)
-        kgs = tl.arange(0, BLOCK_K // GROUP_SIZE)  # 0..(BK/32-1)
-
-        as_ptrs = As_ptr + offs_m[:, None] * stride_asm + (kg0 + kgs)[None, :] * stride_askg
-        tl.max_contiguous(kgs, 16)
-        tl.multiple_of(kg0, 16)
-        tl.multiple_of(as_ptrs, (1,16))
         # As: [BM, BK/32]
         a_scale = tl.load(
-            as_ptrs,
-            mask=(offs_m[:, None] < M),
+            As_ptr + offs_m[:, None] * stride_asm + offs_kg[None, :] * stride_askg,
+            mask=(offs_m[:, None] < M) & (offs_kg[None, :] < (K // GROUP_SIZE)),
             other=0,
         )
 
-        bs_ptrs = Bs_ptr + offs_n[:, None] * stride_bsn + (kg0 + kgs)[None, :] * stride_bskg
-        tl.max_contiguous(kgs, 16)
-        tl.multiple_of(kg0, 16)
-        tl.multiple_of(bs_ptrs, (1,16))
         # Bs: [BN, BK/32]  (IMPORTANT: Bs is indexed by N then K-group; do NOT transpose)
         b_scale = tl.load(
-            bs_ptrs,
-            mask=(offs_n[:, None] < N),
+            Bs_ptr + offs_n[:, None] * stride_bsn + offs_kg[None, :] * stride_bskg,
+            mask=(offs_n[:, None] < N) & (offs_kg[None, :] < (K // GROUP_SIZE)),
             other=0,
         )
 
@@ -139,6 +133,9 @@ def mxfp6fp8_gemm(_A, _B, As, Bs,
 
     As = As.contiguous()
     Bs = Bs.contiguous()
+    
+    assert As.stride(1) == 1   # stride_askg
+    assert Bs.stride(1) == 1   # stride_bskg
 
     mxfp8_dot_scaled_gemm[grid](
         A, B, C, As, Bs,
@@ -413,7 +410,7 @@ def test_mxfp6fp8_dot_scaled_gemm(A, B, afmt, bfmt):
     A_q, A_scale, A_tcast = get_scale_element_tcast(A, afmt)
     B_q, B_scale, B_tcast = get_scale_element_tcast(B, bfmt)
 
-    C = mxfp6fp8_gemm(A_q, B_q, A_scale, B_scale, _afmt=afmt, _bfmt=bfmt, out_dtype=torch.float32)
+    C = mxfp6fp8_gemm(A_q, B_q, A_scale, B_scale, _afmt=afmt, _bfmt=bfmt, BM=128, BN=128, BK=512, out_dtype=torch.float32)
     C_torch = A_tcast.tensor @ B_tcast.tensor.T
 
     print(f"Triton vs Torch error for ({afmt}, {bfmt}): {torch.max(torch.abs(C - C_torch))}")
