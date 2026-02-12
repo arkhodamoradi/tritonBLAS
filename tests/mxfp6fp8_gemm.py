@@ -49,10 +49,10 @@ def mxfp8_dot_scaled_gemm(
 
     # iterate over K tiles
     for k0 in range(0, K, BLOCK_K):
-        tl.multiple_of(k0, 512)
+        tl.multiple_of(k0, BLOCK_K)
         offs_k = k0 + tl.arange(0, BLOCK_K)
         offs_kg = (k0 // GROUP_SIZE) + tl.arange(0, BLOCK_K // GROUP_SIZE)
-        tl.max_contiguous(offs_kg, 16)
+        tl.max_contiguous(offs_kg, BLOCK_K//GROUP_SIZE)
         #tl.multiple_of(stride_askg, 1)
         #tl.multiple_of(stride_bskg, 1)
 
@@ -410,7 +410,7 @@ def test_mxfp6fp8_dot_scaled_gemm(A, B, afmt, bfmt):
     A_q, A_scale, A_tcast = get_scale_element_tcast(A, afmt)
     B_q, B_scale, B_tcast = get_scale_element_tcast(B, bfmt)
 
-    C = mxfp6fp8_gemm(A_q, B_q, A_scale, B_scale, _afmt=afmt, _bfmt=bfmt, BM=128, BN=128, BK=512, out_dtype=torch.float32)
+    C = mxfp6fp8_gemm(A_q, B_q, A_scale, B_scale, _afmt=afmt, _bfmt=bfmt, BK=512, out_dtype=torch.float32)
     C_torch = A_tcast.tensor @ B_tcast.tensor.T
 
     print(f"Triton vs Torch error for ({afmt}, {bfmt}): {torch.max(torch.abs(C - C_torch))}")
