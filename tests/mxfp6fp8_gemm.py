@@ -4,6 +4,8 @@ import triton.language as tl
 import torch
 import tcast
 import numpy as np
+import os
+import time
 
 @triton.jit
 def mxfp8_dot_scaled_gemm(
@@ -11,13 +13,16 @@ def mxfp8_dot_scaled_gemm(
     As_ptr, Bs_ptr,                       # e8m0 scales (uint8)
     M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
 
+    # A: [M, K]
     stride_am: tl.constexpr, stride_ak: tl.constexpr,
+    # B: [N, K]
     stride_bn: tl.constexpr, stride_bk: tl.constexpr,
+    # C: [M, N]
     stride_cm: tl.constexpr, stride_cn: tl.constexpr,
 
     # As: [M, K//32]
     stride_asm: tl.constexpr, stride_askg: tl.constexpr,
-    # Bs: [N, K//32]  (IMPORTANT: indexed by N, then K-group)
+    # Bs: [N, K//32]  
     stride_bsn: tl.constexpr, stride_bskg: tl.constexpr,
 
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
@@ -47,14 +52,17 @@ def mxfp8_dot_scaled_gemm(
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
+    offs_kg_tile = tl.arange(0, BLOCK_K // GROUP_SIZE)
+
+    #tl.max_contiguous(offs_kg_tile, 16)
+    #tl.multiple_of(offs_kg_tile, 16)
+
     # iterate over K tiles
     for k0 in range(0, K, BLOCK_K):
-        tl.multiple_of(k0, BLOCK_K)
         offs_k = k0 + tl.arange(0, BLOCK_K)
-        offs_kg = (k0 // GROUP_SIZE) + tl.arange(0, BLOCK_K // GROUP_SIZE)
-        tl.max_contiguous(offs_kg, BLOCK_K//GROUP_SIZE)
-        #tl.multiple_of(stride_askg, 1)
-        #tl.multiple_of(stride_bskg, 1)
+        offs_kg = (k0 // GROUP_SIZE) + offs_kg_tile
+        
+        #tl.multiple_of(k0, 512)
 
         # ----- load FP8 tiles -----
         # A: [BM, BK]
@@ -137,6 +145,7 @@ def mxfp6fp8_gemm(_A, _B, As, Bs,
     assert As.stride(1) == 1   # stride_askg
     assert Bs.stride(1) == 1   # stride_bskg
 
+    _start = time.time()
     mxfp8_dot_scaled_gemm[grid](
         A, B, C, As, Bs,
         M, N, K,
@@ -151,6 +160,8 @@ def mxfp6fp8_gemm(_A, _B, As, Bs,
         OUT_DTYPE=tl.float16 if out_dtype == torch.float16 else (tl.bfloat16 if out_dtype == torch.bfloat16 else tl.float32),
         num_warps=num_warps,
     )
+    _end = time.time()
+    print(f"Total execution time: {_end - _start:.2f} seconds")
     return C
 
 @triton.jit
@@ -402,7 +413,7 @@ def get_scale_element_tcast(x, xfmt):
 
     return x_q, x_scale, x_tcast
 
-def test_mxfp6fp8_dot_scaled_gemm(A, B, afmt, bfmt):
+def test_mxfp6fp8_dot_scaled_gemm(A, B, afmt, bfmt, bm, bn, bk, group_m, num_warps):
     
     assert A.shape[1] == B.shape[1], "Inner dimensions must match for GEMM"
     M, N, K = A.shape[0], B.shape[0], A.shape[1]
@@ -410,16 +421,54 @@ def test_mxfp6fp8_dot_scaled_gemm(A, B, afmt, bfmt):
     A_q, A_scale, A_tcast = get_scale_element_tcast(A, afmt)
     B_q, B_scale, B_tcast = get_scale_element_tcast(B, bfmt)
 
-    C = mxfp6fp8_gemm(A_q, B_q, A_scale, B_scale, _afmt=afmt, _bfmt=bfmt, BK=512, out_dtype=torch.float32)
+    C = mxfp6fp8_gemm(A_q, B_q, A_scale, B_scale, _afmt=afmt, _bfmt=bfmt, BM=bm, BN=bn, BK=bk, group_m=group_m, num_warps=num_warps, out_dtype=torch.float32)
     C_torch = A_tcast.tensor @ B_tcast.tensor.T
 
     print(f"Triton vs Torch error for ({afmt}, {bfmt}): {torch.max(torch.abs(C - C_torch))}")
 
+def search_in_files(root_dir, filename_pattern=None, search_strings=["buffer_load_ubyte"], print_lines=False):
+    out_dict = {}
+    for search_string in search_strings:
+        out_dict[search_string] = 0
+    for root, dirs, files in os.walk(root_dir):
+        for file in files:
+            if filename_pattern and not file.endswith(filename_pattern):
+                continue
+
+            file_path = os.path.join(root, file)
+            # copy the file to the current directory
+            os.system(f"cp {file_path} .")
+
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    for lineno, line in enumerate(f, 1):
+                        for search_string in search_strings:
+                            if search_string in line:
+                                if print_lines:
+                                    print(f"{file_path}:{lineno}: {line.strip()}")
+                                out_dict[search_string] += 1
+            except Exception as e:
+                print(f"Could not read {file_path}: {e}")
+    for search_string, count in out_dict.items():
+        print(f"Total occurrences of '{search_string}': {count}")
+
 if __name__ == "__main__":
-    M, N, K = 1024, 1024, 1024
+    M = N = 64
+    BM = BN = 64
+    K = 128
+    BK = 128
+    GROUP_M = 1
+    NUM_WARPS = 1
+    AFMTS = ["e4m3"] #, "e2m3"]
+    BFMTS = ["e4m3"] #, "e2m3"]
+    STRINGS = ["buffer_load_ubyte", "buffer_load_ushort", "buffer_load_dword ", "buffer_load_dwordx2"]
+
     A = torch.randn((M, K), device="cuda")
     B = torch.randn((N, K), device="cuda")
+    
+    for afmt in AFMTS:
+        for bfmt in BFMTS:
+            test_mxfp6fp8_dot_scaled_gemm(A, B, afmt=afmt, bfmt=bfmt, bm=BM, bn=BN, bk=BK, group_m=GROUP_M, num_warps=NUM_WARPS)
 
-    for afmt in ["e4m3", "e2m3"]:
-        for bfmt in ["e4m3", "e2m3"]:
-            test_mxfp6fp8_dot_scaled_gemm(A, B, afmt=afmt, bfmt=bfmt)
+    search_in_files("/root/.triton/cache/", filename_pattern="mxfp8_dot_scaled_gemm.amdgcn", search_strings=STRINGS)
+
