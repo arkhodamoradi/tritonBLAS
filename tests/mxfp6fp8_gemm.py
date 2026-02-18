@@ -454,8 +454,8 @@ def search_in_files(root_dir, filename_pattern=None, search_strings=["buffer_loa
         print(f"Total occurrences of '{search_string}': {count}")
 
 if __name__ == "__main__":
-    M = N = 1024
-    BM = BN = 1024
+    M = N = 64
+    BM = BN = 64
     K = 128
     BK = 128
     GROUP_M = 1
@@ -473,8 +473,3 @@ if __name__ == "__main__":
             test_mxfp6fp8_dot_scaled_gemm(A, B, afmt=afmt, bfmt=bfmt, bm=BM, bn=BN, bk=BK, group_m=GROUP_M, num_warps=NUM_WARPS, num_stages=NUM_STAGES)
 
     search_in_files("/root/.triton/cache/", filename_pattern="mxfp8_dot_scaled_gemm.amdgcn", search_strings=STRINGS)
-
-# 1024 --> 3.0703
-# 512 --> 0.5490
-# 256 --> 0.1367
-# 128 --> 0.0113
