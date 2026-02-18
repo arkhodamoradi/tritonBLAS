@@ -111,7 +111,7 @@ def mxfp8_dot_scaled_gemm(
 
 def mxfp6fp8_gemm(_A, _B, As, Bs,
               BM=128, BN=128, BK=128,
-              num_warps=8, group_m=8, num_stages=1,
+              num_warps=8, group_m=8, num_stages=1, nonkdim=32,
               _afmt="e4m3", _bfmt="e4m3", out_dtype=torch.float16):
 
     if _afmt == "e2m3":
@@ -145,6 +145,8 @@ def mxfp6fp8_gemm(_A, _B, As, Bs,
     assert As.stride(1) == 1   # stride_askg
     assert Bs.stride(1) == 1   # stride_bskg
 
+    kernel_kwargs = {"matrix_instr_nonkdim": nonkdim}
+
     ms = tt.do_bench( lambda: mxfp8_dot_scaled_gemm[grid](
         A, B, C, As, Bs,
         M, N, K,
@@ -159,9 +161,10 @@ def mxfp6fp8_gemm(_A, _B, As, Bs,
         OUT_DTYPE=tl.float16 if out_dtype == torch.float16 else (tl.bfloat16 if out_dtype == torch.bfloat16 else tl.float32),
         num_warps=num_warps,
         num_stages=num_stages,
+        **kernel_kwargs,
     ), warmup=10, rep=1000)
 
-    print(f"Profiler: {ms:.4f}")
+    print(f"Time: {ms:.4f} ms, PFLOPS: {(2*M*N*K)/(ms*1e12):.4f}")
 
     return C
 
@@ -414,7 +417,7 @@ def get_scale_element_tcast(x, xfmt):
 
     return x_q, x_scale, x_tcast
 
-def test_mxfp6fp8_dot_scaled_gemm(A, B, afmt, bfmt, bm, bn, bk, group_m, num_warps, num_stages):
+def test_mxfp6fp8_dot_scaled_gemm(A, B, afmt, bfmt, bm, bn, bk, group_m, num_warps, num_stages, nonkdim):
     
     assert A.shape[1] == B.shape[1], "Inner dimensions must match for GEMM"
     M, N, K = A.shape[0], B.shape[0], A.shape[1]
@@ -422,7 +425,7 @@ def test_mxfp6fp8_dot_scaled_gemm(A, B, afmt, bfmt, bm, bn, bk, group_m, num_war
     A_q, A_scale, A_tcast = get_scale_element_tcast(A, afmt)
     B_q, B_scale, B_tcast = get_scale_element_tcast(B, bfmt)
 
-    C = mxfp6fp8_gemm(A_q, B_q, A_scale, B_scale, _afmt=afmt, _bfmt=bfmt, BM=bm, BN=bn, BK=bk, group_m=group_m, num_warps=num_warps, num_stages=num_stages, out_dtype=torch.float32)
+    C = mxfp6fp8_gemm(A_q, B_q, A_scale, B_scale, _afmt=afmt, _bfmt=bfmt, BM=bm, BN=bn, BK=bk, group_m=group_m, num_warps=num_warps, num_stages=num_stages, nonkdim=nonkdim, out_dtype=torch.float32)
     C_torch = A_tcast.tensor @ B_tcast.tensor.T
 
     print(f"Triton vs Torch error for ({afmt}, {bfmt}): {torch.max(torch.abs(C - C_torch))}")
@@ -454,22 +457,24 @@ def search_in_files(root_dir, filename_pattern=None, search_strings=["buffer_loa
         print(f"Total occurrences of '{search_string}': {count}")
 
 if __name__ == "__main__":
-    M = N = 64
-    BM = BN = 64
-    K = 128
+    M = N = 8192
+    BM = BN = 256
+    K = 8192
     BK = 128
     GROUP_M = 1
-    NUM_WARPS = 1
-    NUM_STAGES = 1
-    AFMTS = ["e4m3"] #, "e2m3"]
-    BFMTS = ["e4m3"] #, "e2m3"]
-    STRINGS = ["buffer_load_ubyte", "buffer_load_ushort", "buffer_load_dword ", "buffer_load_dwordx2"]
-
+    NUM_WARPS = 8 # 8
+    NUM_STAGES = 2 # 2
+    NONKDIM = 16 if BK%128==0 else 32
+    AFMTS = ["e4m3"]#, "e2m3"]
+    BFMTS = ["e4m3"]#, "e2m3"]
+    STRINGS = ["buffer_load_ubyte", "buffer_load_sbyte", "buffer_load_ushort", "buffer_load_dword ", "buffer_load_dwordx2", "v_mfma_scale_f32_32x32x64_f8f6f4", "v_mfma_scale_f32_16x16x128_f8f6f4"]
+    torch.manual_seed(123)
     A = torch.randn((M, K), device="cuda")
     B = torch.randn((N, K), device="cuda")
     
     for afmt in AFMTS:
         for bfmt in BFMTS:
-            test_mxfp6fp8_dot_scaled_gemm(A, B, afmt=afmt, bfmt=bfmt, bm=BM, bn=BN, bk=BK, group_m=GROUP_M, num_warps=NUM_WARPS, num_stages=NUM_STAGES)
+            test_mxfp6fp8_dot_scaled_gemm(A, B, afmt=afmt, bfmt=bfmt, bm=BM, bn=BN, bk=BK, group_m=GROUP_M, num_warps=NUM_WARPS, num_stages=NUM_STAGES, nonkdim=NONKDIM)
 
     search_in_files("/root/.triton/cache/", filename_pattern="mxfp8_dot_scaled_gemm.amdgcn", search_strings=STRINGS)
+
