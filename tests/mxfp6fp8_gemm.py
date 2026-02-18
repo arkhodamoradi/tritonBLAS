@@ -474,6 +474,7 @@ if __name__ == "__main__":
 
     search_in_files("/root/.triton/cache/", filename_pattern="mxfp8_dot_scaled_gemm.amdgcn", search_strings=STRINGS)
 
+# 1024 --> 3.0703
 # 512 --> 0.5490
 # 256 --> 0.1367
 # 128 --> 0.0113
