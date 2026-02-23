@@ -8,7 +8,7 @@ import os
 import triton.testing as tt
 
 @triton.jit
-def mxfp8_dot_scaled_gemm(
+def mxfp468_dot_scaled_gemm(
     A_ptr, B_ptr, C_ptr,
     As_ptr, Bs_ptr,                       # e8m0 scales (uint8)
     M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
@@ -29,12 +29,14 @@ def mxfp8_dot_scaled_gemm(
     GROUP_M: tl.constexpr = 8,
     A_FMT: tl.constexpr = "e4m3",
     B_FMT: tl.constexpr = "e4m3",
+    A_DIV_K: tl.constexpr = 2,
+    B_DIV_K: tl.constexpr = 2,
     OUT_DTYPE: tl.constexpr = tl.float16, # tl.float16 / tl.bfloat16 / tl.float32
 ):
     # dot_scaled for MX formats uses group_size=32 for e8m0 scales
     GROUP_SIZE: tl.constexpr = 32
     tl.static_assert(BLOCK_K % GROUP_SIZE == 0, "BLOCK_K must be multiple of 32 for e8m0 scales")
-    tl.static_assert(K % GROUP_SIZE == 0, "K must be multiple of 32 for e8m0 scales (MXFP8)")
+    tl.static_assert(K % GROUP_SIZE == 0, "K must be multiple of 32 for e8m0 scales (MXFP)")
 
     pid = tl.program_id(0)
     grid_m = tl.cdiv(M, BLOCK_M)
@@ -53,29 +55,25 @@ def mxfp8_dot_scaled_gemm(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     offs_kg_tile = tl.arange(0, BLOCK_K // GROUP_SIZE)
-
-    #tl.max_contiguous(offs_kg_tile, 16)
-    #tl.multiple_of(offs_kg_tile, 16)
-
+    
     # iterate over K tiles
     for k0 in range(0, K, BLOCK_K):
-        offs_k = k0 + tl.arange(0, BLOCK_K)
+        offs_k_a = k0//A_DIV_K + tl.arange(0, BLOCK_K//A_DIV_K)
+        offs_k_b = k0//B_DIV_K + tl.arange(0, BLOCK_K//B_DIV_K)
         offs_kg = (k0 // GROUP_SIZE) + offs_kg_tile
-        
-        #tl.multiple_of(k0, 512)
 
         # ----- load FP8 tiles -----
         # A: [BM, BK]
         a = tl.load(
-            A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak,
-            mask=(offs_m[:, None] < M) & (offs_k[None, :] < K),
+            A_ptr + offs_m[:, None] * stride_am + offs_k_a[None, :] * stride_ak,
+            mask=(offs_m[:, None] < M) & (offs_k_a[None, :] < K//A_DIV_K),
             other=0.0,
         )
 
         # B: [BN, BK]
         b = tl.load(
-            B_ptr + offs_n[None, :] * stride_bn + offs_k[:, None] * stride_bk,
-            mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
+            B_ptr + offs_n[None, :] * stride_bn + offs_k_b[:, None] * stride_bk,
+            mask=(offs_k_b[:, None] < K//B_DIV_K) & (offs_n[None, :] < N),
             other=0.0,
         )
 
@@ -109,7 +107,7 @@ def mxfp8_dot_scaled_gemm(
         mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
     )
 
-def mxfp6fp8_gemm(_A, _B, As, Bs,
+def mxfp468_gemm(_A, _B, As, Bs,
               BM=128, BN=128, BK=128,
               num_warps=8, group_m=8, num_stages=1, nonkdim=32,
               _afmt="e4m3", _bfmt="e4m3", out_dtype=torch.float16):
@@ -129,12 +127,34 @@ def mxfp6fp8_gemm(_A, _B, As, Bs,
         B = _B
         bfmt = _bfmt
 
-    M, K = A.shape
-    N, K2 = B.shape
-    assert K == K2
-    assert As.shape == (M, K//32)
-    assert Bs.shape == (N, K//32)
+    M, KA = A.shape
+    N, KB = B.shape
+    
+    if afmt == bfmt:    
+        assert KA == KB
+    elif afmt == "e2m1" and bfmt == "e4m3":
+        assert KA*2 == KB
+    elif afmt == "e4m3" and bfmt == "e2m1":
+        assert KA == KB*2
+    else:
+        raise ValueError(f"Incompatible formats: {afmt} vs {bfmt}")
+    
+    if afmt == "e2m1":
+        K = KA * 2
+    else:
+        K = KA
+
     assert As.dtype == torch.uint8 and Bs.dtype == torch.uint8
+
+    if afmt == "e4m3":
+        assert As.shape == (M, KA//32)
+    else:
+        assert As.shape == (M, KA//16)
+
+    if bfmt == "e4m3":
+        assert Bs.shape == (N, KB//32)
+    else:
+        assert Bs.shape == (N, KB//16)
 
     C = torch.empty((M, N), device=A.device, dtype=out_dtype)
     grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN),)
@@ -147,7 +167,7 @@ def mxfp6fp8_gemm(_A, _B, As, Bs,
 
     kernel_kwargs = {"matrix_instr_nonkdim": nonkdim}
 
-    ms = tt.do_bench( lambda: mxfp8_dot_scaled_gemm[grid](
+    ms = tt.do_bench( lambda: mxfp468_dot_scaled_gemm[grid](
         A, B, C, As, Bs,
         M, N, K,
         A.stride(0), A.stride(1),
@@ -158,6 +178,8 @@ def mxfp6fp8_gemm(_A, _B, As, Bs,
         BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
         GROUP_M=group_m,
         A_FMT=afmt, B_FMT=bfmt,
+        A_DIV_K=2 if afmt == "e2m1" else 1,
+        B_DIV_K=2 if bfmt == "e2m1" else 1,
         OUT_DTYPE=tl.float16 if out_dtype == torch.float16 else (tl.bfloat16 if out_dtype == torch.bfloat16 else tl.float32),
         num_warps=num_warps,
         num_stages=num_stages,
@@ -396,6 +418,91 @@ def triton_fused_unpack_gemm_kernel(packed_tensor, original_shape=None):
 
     return fp8_output    
 
+@triton.jit
+def bf16_to_fp4_e2m1_pack_kernel(
+    x_ptr, y_ptr,
+    M: tl.constexpr, N: tl.constexpr,
+    stride_xm, stride_xn,     # bf16 element strides
+    stride_ym, stride_yn,     # u8 element strides
+    BLOCK_J: tl.constexpr,    # number of output BYTES per program
+):
+    pid_m = tl.program_id(0)
+    pid_jb = tl.program_id(1)
+
+    m = pid_m
+    j0 = pid_jb * BLOCK_J
+    j = j0 + tl.arange(0, BLOCK_J)          # output-byte indices along packed N
+
+    n_even = 2 * j
+    n_odd  = 2 * j + 1
+
+    mask_m = m < M
+    mask_even = mask_m & (n_even < N)
+    mask_odd  = mask_m & (n_odd  < N)
+
+    # Load the pair
+    x_even = tl.load(x_ptr + m * stride_xm + n_even * stride_xn,
+                     mask=mask_even, other=0).to(tl.float32)
+    x_odd  = tl.load(x_ptr + m * stride_xm + n_odd * stride_xn,
+                     mask=mask_odd, other=0).to(tl.float32)
+
+    xb_e = x_even.to(tl.int32, bitcast=True)
+    sign_e = (xb_e >> 31) & 1  # 0/1
+    ax_e = tl.abs(x_even)
+    base_e = tl.zeros_like(ax_e).to(tl.int32)
+    base_e = tl.where(ax_e == 0.0, 0, base_e)
+    base_e = tl.where(ax_e == 0.5, 1, base_e)
+    base_e = tl.where(ax_e == 1.0, 2, base_e)
+    base_e = tl.where(ax_e == 1.5, 3, base_e)
+    base_e = tl.where(ax_e == 2.0, 4, base_e)
+    base_e = tl.where(ax_e == 3.0, 5, base_e)
+    base_e = tl.where(ax_e == 4.0, 6, base_e)
+    base_e = tl.where(ax_e == 6.0, 7, base_e)
+    code_even = (base_e | (sign_e << 3)).to(tl.uint8)   # 0..15
+
+    xb_o = x_odd.to(tl.int32, bitcast=True)
+    sign_o = (xb_o >> 31) & 1  # 0/1
+    ax_o = tl.abs(x_odd)
+    base_o = tl.zeros_like(ax_o).to(tl.int32)
+    base_o = tl.where(ax_o == 0.0, 0, base_o)
+    base_o = tl.where(ax_o == 0.5, 1, base_o)
+    base_o = tl.where(ax_o == 1.0, 2, base_o)
+    base_o = tl.where(ax_o == 1.5, 3, base_o)
+    base_o = tl.where(ax_o == 2.0, 4, base_o)
+    base_o = tl.where(ax_o == 3.0, 5, base_o)
+    base_o = tl.where(ax_o == 4.0, 6, base_o)
+    base_o = tl.where(ax_o == 6.0, 7, base_o)
+    code_odd = (base_o | (sign_o << 3)).to(tl.uint8)    # 0..15
+
+    # If odd is out-of-range, force it to 0 (already masked in load, but keep explicit)
+    code_odd = tl.where(mask_odd, code_odd, 0).to(tl.uint8)
+
+    packed = (code_odd << 4) | code_even 
+
+    out_mask = mask_m & (j < (N + 1) // 2)
+    tl.store(y_ptr + m * stride_ym + j * stride_yn, packed, mask=out_mask)
+
+def bf16_to_fp4_e2m1_pack(x_bf16, BLOCK_N=1024, num_warps=4, num_stages=2):
+    """
+    x_bf16: torch.Tensor [M,N] dtype=torch.bfloat16
+    """
+    
+    assert BLOCK_N % 2 == 0, "BLOCK_N must be even"
+    M, N = x_bf16.shape
+    u8_output = torch.empty((M, N//2), dtype=torch.uint8, device=x_bf16.device)
+
+    grid = (M, triton.cdiv(N, BLOCK_N))
+    bf16_to_fp4_e2m1_pack_kernel[grid](
+        x_bf16, u8_output,
+        M=M, N=N,
+        stride_xm=x_bf16.stride(0), stride_xn=x_bf16.stride(1),
+        stride_ym=u8_output.stride(0),   stride_yn=u8_output.stride(1),
+        BLOCK_J=BLOCK_N,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return u8_output
+
 CASTDICT = {
     "e4m3": tcast.mxfp8e4,
     "e2m3": tcast.mxfp6e2,
@@ -412,12 +519,18 @@ def get_scale_element_tcast(x, xfmt):
     elif xfmt == "e2m3":
         x_scale = x_tcast.scaledata.scale.to(torch.uint8).T.reshape(M, -1)
         x_q = (triton_fused_pack_kernel(x_tcast), x_tcast.tensor.shape)
+    elif xfmt == "e2m1":
+        x_s = 2**((x_tcast.scaledata.scale - 127)).to(torch.float32).T
+        x_q16 = (x_tcast.tensor.view(M, -1, 32) / x_s.view(M, -1).unsqueeze(-1)).to(torch.bfloat16).reshape(M, N)
+        x_scale = x_tcast.scaledata.scale.to(torch.uint8).T.reshape(M, -1)
+        x_q = bf16_to_fp4_e2m1_pack(x_q16)
+
     else:
         raise NotImplementedError(f"Format {xfmt} not implemented")
 
     return x_q, x_scale, x_tcast
 
-def test_mxfp6fp8_dot_scaled_gemm(A, B, afmt, bfmt, bm, bn, bk, group_m, num_warps, num_stages, nonkdim):
+def test_mxfp468_dot_scaled_gemm(A, B, afmt, bfmt, bm, bn, bk, group_m, num_warps, num_stages, nonkdim):
     
     assert A.shape[1] == B.shape[1], "Inner dimensions must match for GEMM"
     M, N, K = A.shape[0], B.shape[0], A.shape[1]
@@ -425,7 +538,7 @@ def test_mxfp6fp8_dot_scaled_gemm(A, B, afmt, bfmt, bm, bn, bk, group_m, num_war
     A_q, A_scale, A_tcast = get_scale_element_tcast(A, afmt)
     B_q, B_scale, B_tcast = get_scale_element_tcast(B, bfmt)
 
-    C = mxfp6fp8_gemm(A_q, B_q, A_scale, B_scale, _afmt=afmt, _bfmt=bfmt, BM=bm, BN=bn, BK=bk, group_m=group_m, num_warps=num_warps, num_stages=num_stages, nonkdim=nonkdim, out_dtype=torch.float32)
+    C = mxfp468_gemm(A_q, B_q, A_scale, B_scale, _afmt=afmt, _bfmt=bfmt, BM=bm, BN=bn, BK=bk, group_m=group_m, num_warps=num_warps, num_stages=num_stages, nonkdim=nonkdim, out_dtype=torch.float32)
     C_torch = A_tcast.tensor @ B_tcast.tensor.T
 
     print(f"Triton vs Torch error for ({afmt}, {bfmt}): {torch.max(torch.abs(C - C_torch))}")
@@ -457,16 +570,16 @@ def search_in_files(root_dir, filename_pattern=None, search_strings=["buffer_loa
         print(f"Total occurrences of '{search_string}': {count}")
 
 if __name__ == "__main__":
-    M = N = 8192
+    M = N = 4096
     BM = BN = 256
-    K = 8192
+    K = 4096
     BK = 128
     GROUP_M = 1
     NUM_WARPS = 8 # 8
     NUM_STAGES = 2 # 2
     NONKDIM = 16 if BK%128==0 else 32
-    AFMTS = ["e4m3"]#, "e2m3"]
-    BFMTS = ["e4m3"]#, "e2m3"]
+    AFMTS = ["e4m3", "e2m3", "e2m1"]
+    BFMTS = ["e4m3", "e2m3", "e2m1"]
     STRINGS = ["buffer_load_ubyte", "buffer_load_sbyte", "buffer_load_ushort", "buffer_load_dword ", "buffer_load_dwordx2", "v_mfma_scale_f32_32x32x64_f8f6f4", "v_mfma_scale_f32_16x16x128_f8f6f4"]
     torch.manual_seed(123)
     A = torch.randn((M, K), device="cuda")
@@ -474,7 +587,6 @@ if __name__ == "__main__":
     
     for afmt in AFMTS:
         for bfmt in BFMTS:
-            test_mxfp6fp8_dot_scaled_gemm(A, B, afmt=afmt, bfmt=bfmt, bm=BM, bn=BN, bk=BK, group_m=GROUP_M, num_warps=NUM_WARPS, num_stages=NUM_STAGES, nonkdim=NONKDIM)
+            test_mxfp468_dot_scaled_gemm(A, B, afmt=afmt, bfmt=bfmt, bm=BM, bn=BN, bk=BK, group_m=GROUP_M, num_warps=NUM_WARPS, num_stages=NUM_STAGES, nonkdim=NONKDIM)
 
-    search_in_files("/root/.triton/cache/", filename_pattern="mxfp8_dot_scaled_gemm.amdgcn", search_strings=STRINGS)
-
+    search_in_files("/root/.triton/cache/", filename_pattern="mxfp468_dot_scaled_gemm.amdgcn", search_strings=STRINGS)
