@@ -112,17 +112,20 @@ def mxfp468_gemm(_A, _B, As, Bs,
               num_warps=8, group_m=8, num_stages=1, nonkdim=32,
               _afmt="e4m3", _bfmt="e4m3", out_dtype=torch.float16):
 
-    if _afmt == "e2m3":
+    assert _afmt in ["e4m3", "e5m2", "e2m3", "e3m2", "e2m1"] and _bfmt in ["e4m3", "e5m2", "e2m3", "e3m2", "e2m1"], f"Incompatible formats: {_afmt} vs {_bfmt}"
+
+    if _afmt == "e2m3" or _afmt == "e3m2":
         # unpack FP6 format to FP8 for GEMM
-        A = triton_fused_unpack_gemm_kernel(_A[0], _A[1])
-        afmt = "e4m3"
+        A = triton_fused_unpack_gemm_kernel(_A[0], _A[1], _afmt)
+        afmt = "e4m3" if _afmt == "e2m3" else "e5m2"
     else:
         A = _A
         afmt = _afmt
-    if _bfmt == "e2m3":
+
+    if _bfmt == "e2m3" or _bfmt == "e3m2":
         # unpack FP6 format to FP8 for GEMM
-        B = triton_fused_unpack_gemm_kernel(_B[0], _B[1])
-        bfmt = "e4m3"
+        B = triton_fused_unpack_gemm_kernel(_B[0], _B[1], _bfmt)
+        bfmt = "e4m3" if _bfmt == "e2m3" else "e5m2"
     else:
         B = _B
         bfmt = _bfmt
@@ -131,13 +134,13 @@ def mxfp468_gemm(_A, _B, As, Bs,
     N, KB = B.shape
     
     if afmt == bfmt:    
-        assert KA == KB
-    elif afmt == "e2m1" and bfmt == "e4m3":
+        assert KA == KB        
+    elif afmt == "e2m1":
         assert KA*2 == KB
-    elif afmt == "e4m3" and bfmt == "e2m1":
+    elif bfmt == "e2m1":
         assert KA == KB*2
     else:
-        raise ValueError(f"Incompatible formats: {afmt} vs {bfmt}")
+        assert KA == KB
     
     if afmt == "e2m1":
         K = KA * 2
@@ -146,12 +149,12 @@ def mxfp468_gemm(_A, _B, As, Bs,
 
     assert As.dtype == torch.uint8 and Bs.dtype == torch.uint8
 
-    if afmt == "e4m3":
+    if afmt == "e4m3" or afmt == "e5m2":
         assert As.shape == (M, KA//32)
     else:
         assert As.shape == (M, KA//16)
 
-    if bfmt == "e4m3":
+    if bfmt == "e4m3" or bfmt == "e5m2":
         assert Bs.shape == (N, KB//32)
     else:
         assert Bs.shape == (N, KB//16)
@@ -233,7 +236,7 @@ def triton_fp6_pack_24bit_kernel(
     tl.store(output_ptr + out_idx + 2, byte2)
 
 @triton.jit
-def triton_descale_and_pack_kernel(
+def triton_descale_and_pack_kernel_e2m3(
     fp6_tensor_ptr, scale_tensor_ptr, output_ptr,
     N, n_scales, group_size,
     BLOCK_SIZE: tl.constexpr
@@ -293,7 +296,67 @@ def triton_descale_and_pack_kernel(
     # Mode 1 will require a separate kernel to pack into 24-bit groups
     tl.store(output_ptr + offsets, fp6_packed.to(tl.uint8), mask=mask)
 
-def triton_fused_pack_kernel(tcast_tensor):
+@triton.jit
+def triton_descale_and_pack_kernel_e3m2(
+    fp6_tensor_ptr, scale_tensor_ptr, output_ptr,
+    N, n_scales, group_size,
+    BLOCK_SIZE: tl.constexpr
+):
+    """
+    Dequantize FP6 fake tensor and pack into 8-bit format for mode 0.
+    
+    Args:
+        fp6_tensor_ptr: Pointer to FP6 tensor values
+        scale_tensor_ptr: Pointer to scale tensor (int32 exponents)
+        output_ptr: Pointer to output tensor (packed FP6 in uint8)
+        N: Total number of elements
+        n_scales: Number of scale values
+        group_size: Number of elements per scale group
+        BLOCK_SIZE: Block size for kernel
+    """
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+
+    # Load FP6 values (already in bfloat16 format from tcast)
+    vals = tl.load(fp6_tensor_ptr + offsets, mask=mask, other=0.0).to(tl.bfloat16)
+
+    # Compute which scale group each element belongs to
+    scale_indices = offsets // group_size
+    scale_mask = scale_indices < n_scales
+    
+    # Load scale values (int32 exponents)
+    scale_vals = tl.load(scale_tensor_ptr + scale_indices, mask=mask & scale_mask, other=0).to(tl.uint8)
+
+    # Compute scaling factor: 2^(127 - S)
+    scale_factors = tl.exp2((127 - scale_vals).to(tl.float32)).to(tl.bfloat16)
+
+    # Apply scale
+    scaled_vals = vals * scale_factors
+      
+    # Convert to int16 for bit manipulation
+    bf16_int = scaled_vals.to(tl.int16, bitcast=True)
+    
+    # Extract components from BF16: [sign(1)][exponent(8)][mantissa(7)]
+    sign = (bf16_int >> 15) & 0x1
+    exponent = (bf16_int >> 7) & 0xFF
+    mantissa = bf16_int & 0x7F
+    
+    # Convert to FP6 format
+    fp6_exponent = tl.where((exponent < 125), 0, exponent - 124)
+    #fp6_mantissa = mantissa >> 5  # Take top 2 bits of mantissa
+    fp6_mantissa =  tl.where((exponent == 123), 1, 
+                    tl.where((exponent == 124), 2 | (mantissa >> 6), mantissa >> 5))
+
+    # Pack into FP6 format: [00][sign(1)][exp(3)][mantissa(2)]
+    fp6_packed = (sign << 5) | (fp6_exponent << 2) | fp6_mantissa
+    
+    # For both modes, store the FP6 values as uint8
+    # Mode 1 will require a separate kernel to pack into 24-bit groups
+    tl.store(output_ptr + offsets, fp6_packed.to(tl.uint8), mask=mask)
+
+def triton_fused_pack_kernel(tcast_tensor, xfmt):
     fp6_tensor = tcast_tensor.tensor
     scale_tensor = tcast_tensor.scaledata.scale
     n_elements = fp6_tensor.numel()
@@ -310,11 +373,18 @@ def triton_fused_pack_kernel(tcast_tensor):
     BLOCK_SIZE = 1024
     grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
     
-    triton_descale_and_pack_kernel[grid](
-        fp6_tensor, scale_tensor, fp6_output,
-        n_elements, n_scales, group_size,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
+    if xfmt == "e2m3":
+        triton_descale_and_pack_kernel_e2m3[grid](
+            fp6_tensor, scale_tensor, fp6_output,
+            n_elements, n_scales, group_size,
+            BLOCK_SIZE=BLOCK_SIZE
+        )
+    else:
+        triton_descale_and_pack_kernel_e3m2[grid](
+            fp6_tensor, scale_tensor, fp6_output,
+            n_elements, n_scales, group_size,
+            BLOCK_SIZE=BLOCK_SIZE
+        )
 
     # Only Mode 1: 24-bit packing (4 FP6 values -> 3 bytes)
     # Calculate groups using ceiling division - kernel handles padding automatically
@@ -338,7 +408,7 @@ def triton_fused_pack_kernel(tcast_tensor):
     return packed_output.reshape(-1, 3)
 
 @triton.jit
-def triton_fp6_unpack_24bit_kernel(
+def triton_e2m3_unpack_24bit_kernel(
     packed_ptr, fp8_ptr,
     n_groups, n_elements,
     BLOCK_SIZE: tl.constexpr
@@ -386,7 +456,54 @@ def triton_fp6_unpack_24bit_kernel(
             fp8_packed = (sign << 7) | (fp8_exponent << 3) | fp8_mantissa
             tl.store(fp8_ptr + idx, fp8_packed.to(tl.uint8))
 
-def triton_fused_unpack_gemm_kernel(packed_tensor, original_shape=None):
+@triton.jit
+def triton_e3m2_unpack_24bit_kernel(
+    packed_ptr, fp8_ptr,
+    n_groups, n_elements,
+    BLOCK_SIZE: tl.constexpr
+):
+    """Unpack 24-bit packed format to FP8 E4M3 and BF16 values (Mode 1)"""
+    pid = tl.program_id(0)
+    
+    if pid >= n_groups:
+        return
+    
+    # Load 3 bytes for this group
+    byte_idx = pid * 3
+    byte0 = tl.load(packed_ptr + byte_idx).to(tl.uint32)
+    byte1 = tl.load(packed_ptr + byte_idx + 1).to(tl.uint32)
+    byte2 = tl.load(packed_ptr + byte_idx + 2).to(tl.uint32)
+    
+    # Reconstruct 24-bit value
+    packed_24bit = byte0 | (byte1 << 8) | (byte2 << 16)
+    
+    # Extract 4 FP6 values
+    base_idx = pid * 4
+    for i in tl.static_range(4):
+        idx = base_idx + i
+        if idx < n_elements:
+            # Extract 6-bit FP6 value
+            shift = i * 6
+            fp6_val = (packed_24bit >> shift) & 0x3F
+            
+            # Extract FP6 components: [S][EEE][MM]
+            sign = ((fp6_val >> 5) & 0x1).to(tl.int32)
+            fp6_exponent = ((fp6_val >> 2) & 0x7).to(tl.int32)
+            fp6_mantissa = (fp6_val & 0x3).to(tl.int32)
+            
+            # 1. Convert to FP8 format
+            fp8_exponent = tl.where((fp6_exponent == 0) & (fp6_mantissa == 0), 0, 
+                            tl.where((fp6_exponent == 0) & (fp6_mantissa == 1), 11,
+                            tl.where((fp6_exponent == 0) & (fp6_mantissa > 1), 12,fp6_exponent + 12)))
+
+            fp8_mantissa = tl.where((fp6_exponent == 0) & (fp6_mantissa == 0), 0, 
+                            tl.where((fp6_exponent == 0) & (fp6_mantissa == 1), 0,
+                            tl.where((fp6_exponent == 0) & (fp6_mantissa > 1), (fp6_mantissa & 1) << 1, fp6_mantissa)))
+            
+            fp8_packed = (sign << 7) | (fp8_exponent << 2) | fp8_mantissa
+            tl.store(fp8_ptr + idx, fp8_packed.to(tl.uint8))
+
+def triton_fused_unpack_gemm_kernel(packed_tensor, original_shape, xfmt):
     device = packed_tensor.device
     
     if device.type != 'cuda':
@@ -403,20 +520,27 @@ def triton_fused_unpack_gemm_kernel(packed_tensor, original_shape=None):
     # Launch kernel
     grid = (n_groups,)
     BLOCK_SIZE = 1
-    triton_fp6_unpack_24bit_kernel[grid](
-        packed_bytes, fp8_output,
-        n_groups, n_elements,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
+    if xfmt == "e2m3":
+        triton_e2m3_unpack_24bit_kernel[grid](
+            packed_bytes, fp8_output,
+            n_groups, n_elements,
+            BLOCK_SIZE=BLOCK_SIZE
+        )
+        # Trim to original size if shape provided
+        fp8_output = fp8_output.view(torch.float8_e4m3fn)
     
-    # Trim to original size if shape provided
-    fp8_output = fp8_output.view(torch.float8_e4m3fn)
-    if original_shape:
-        original_size = np.prod(original_shape)
-        fp8_output = fp8_output[:original_size]
-        return fp8_output.reshape(original_shape)
-
-    return fp8_output    
+    else:
+        triton_e3m2_unpack_24bit_kernel[grid](
+            packed_bytes, fp8_output,
+            n_groups, n_elements,
+            BLOCK_SIZE=BLOCK_SIZE
+        )
+        # Trim to original size if shape provided
+        fp8_output = fp8_output.view(torch.float8_e5m2)
+    
+    original_size = np.prod(original_shape)
+    fp8_output = fp8_output[:original_size]
+    return fp8_output.reshape(original_shape)
 
 @triton.jit
 def bf16_to_fp4_e2m1_pack_kernel(
@@ -505,7 +629,9 @@ def bf16_to_fp4_e2m1_pack(x_bf16, BLOCK_N=1024, num_warps=4, num_stages=2):
 
 CASTDICT = {
     "e4m3": tcast.mxfp8e4,
+    "e5m2": tcast.mxfp8e5,
     "e2m3": tcast.mxfp6e2,
+    "e3m2": tcast.mxfp6e3,
     "e2m1": tcast.mxfp4e2,
 }
 def get_scale_element_tcast(x, xfmt):
@@ -516,9 +642,16 @@ def get_scale_element_tcast(x, xfmt):
         x_s = 2**((x_tcast.scaledata.scale - 127)).to(torch.float32).T
         x_q = (x_tcast.tensor.view(M, -1, 32) / x_s.view(M, -1).unsqueeze(-1)).to(torch.float8_e4m3fn).reshape(M, N)
         x_scale = x_tcast.scaledata.scale.to(torch.uint8).T.reshape(M, -1)
+    elif xfmt == "e5m2":
+        x_s = 2**((x_tcast.scaledata.scale - 127)).to(torch.float32).T
+        x_q = (x_tcast.tensor.view(M, -1, 32) / x_s.view(M, -1).unsqueeze(-1)).to(torch.float8_e5m2).reshape(M, N)
+        x_scale = x_tcast.scaledata.scale.to(torch.uint8).T.reshape(M, -1)
     elif xfmt == "e2m3":
         x_scale = x_tcast.scaledata.scale.to(torch.uint8).T.reshape(M, -1)
-        x_q = (triton_fused_pack_kernel(x_tcast), x_tcast.tensor.shape)
+        x_q = (triton_fused_pack_kernel(x_tcast, xfmt), x_tcast.tensor.shape)
+    elif xfmt == "e3m2":
+        x_scale = x_tcast.scaledata.scale.to(torch.uint8).T.reshape(M, -1)
+        x_q = (triton_fused_pack_kernel(x_tcast, xfmt), x_tcast.tensor.shape)
     elif xfmt == "e2m1":
         x_s = 2**((x_tcast.scaledata.scale - 127)).to(torch.float32).T
         x_q16 = (x_tcast.tensor.view(M, -1, 32) / x_s.view(M, -1).unsqueeze(-1)).to(torch.bfloat16).reshape(M, N)
@@ -539,9 +672,16 @@ def test_mxfp468_dot_scaled_gemm(A, B, afmt, bfmt, bm, bn, bk, group_m, num_warp
     B_q, B_scale, B_tcast = get_scale_element_tcast(B, bfmt)
 
     C = mxfp468_gemm(A_q, B_q, A_scale, B_scale, _afmt=afmt, _bfmt=bfmt, BM=bm, BN=bn, BK=bk, group_m=group_m, num_warps=num_warps, num_stages=num_stages, nonkdim=nonkdim, out_dtype=torch.float32)
-    C_torch = A_tcast.tensor @ B_tcast.tensor.T
+    _start = torch.cuda.Event(enable_timing=True)
+    _end = torch.cuda.Event(enable_timing=True)
+    _start.record()
+    for i in range(1000):
+        C_torch = A_tcast.tensor @ B_tcast.tensor.T
+    _end.record()
+    torch.cuda.synchronize()
+    print(f"Torch time: {_start.elapsed_time(_end)/1000.0:.4f} ms")
 
-    print(f"Triton vs Torch error for ({afmt}, {bfmt}): {torch.max(torch.abs(C - C_torch))}")
+    print(f"Triton vs Torch error for ({afmt}, {bfmt}): {torch.max(torch.abs(C - C_torch))}\n")
 
 def search_in_files(root_dir, filename_pattern=None, search_strings=["buffer_load_ubyte"], print_lines=False):
     out_dict = {}
@@ -578,8 +718,8 @@ if __name__ == "__main__":
     NUM_WARPS = 8 # 8
     NUM_STAGES = 2 # 2
     NONKDIM = 16 if BK%128==0 else 32
-    AFMTS = ["e4m3", "e2m3", "e2m1"]
-    BFMTS = ["e4m3", "e2m3", "e2m1"]
+    AFMTS = ["e4m3", "e5m2", "e2m3", "e3m2", "e2m1"] 
+    BFMTS = ["e4m3", "e5m2", "e2m3", "e3m2", "e2m1"]
     STRINGS = ["buffer_load_ubyte", "buffer_load_sbyte", "buffer_load_ushort", "buffer_load_dword ", "buffer_load_dwordx2", "v_mfma_scale_f32_32x32x64_f8f6f4", "v_mfma_scale_f32_16x16x128_f8f6f4"]
     torch.manual_seed(123)
     A = torch.randn((M, K), device="cuda")
