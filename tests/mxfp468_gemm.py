@@ -29,8 +29,8 @@ def mxfp468_dot_scaled_gemm(
     GROUP_M: tl.constexpr = 8,
     A_FMT: tl.constexpr = "e4m3",
     B_FMT: tl.constexpr = "e4m3",
-    A_DIV_K: tl.constexpr = 2,
-    B_DIV_K: tl.constexpr = 2,
+    A_DIV_K: tl.constexpr = 1,
+    B_DIV_K: tl.constexpr = 1,
     OUT_DTYPE: tl.constexpr = tl.float16, # tl.float16 / tl.bfloat16 / tl.float32
 ):
     # dot_scaled for MX formats uses group_size=32 for e8m0 scales
