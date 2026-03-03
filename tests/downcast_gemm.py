@@ -22,42 +22,55 @@ def f32_to_mxfp8_sr_kernel_hw(
     stride_outk,    
     stride_sm,      
     stride_sg,      
-    GROUP_SIZE: tl.constexpr,  
+    GROUP_SIZE: tl.constexpr,
+    GROUPS_PER_BLOCK: tl.constexpr,
     FP8_EXP_OFFSET: tl.constexpr, 
     IS_E4M3: tl.constexpr,     # True for e4m3, False for e5m2
 ):
     """
     Triton kernel for F32 to MXFP8 conversion using hardware instructions.
+    Processes multiple groups per workgroup for 100% thread utilization.
+    With GROUPS_PER_BLOCK=2 and GROUP_SIZE=32, we process 64 elements with 64 threads.
     """
     pid_m = tl.program_id(0) 
-    pid_g = tl.program_id(1) 
+    pid_g = tl.program_id(1)  
+
+    # Total elements per block = GROUP_SIZE * GROUPS_PER_BLOCK 
+    BLOCK_SIZE: tl.constexpr = GROUP_SIZE * GROUPS_PER_BLOCK
     
-    group_start = pid_g * GROUP_SIZE
-    offsets = group_start + tl.arange(0, GROUP_SIZE)
+    block_start = pid_g * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
     
     x_ptrs = x_ptr + pid_m * stride_xm + offsets * stride_xk
     mask = offsets < K
     x = tl.load(x_ptrs, mask=mask, other=0.0)
     
-    absmax = tl.max(tl.abs(x))
+    # Reshape to [GROUPS_PER_BLOCK, GROUP_SIZE] to compute per-group absmax
+    x_grouped = tl.reshape(x, (GROUPS_PER_BLOCK, GROUP_SIZE))
+    
+    # Compute absmax for each group
+    absmax = tl.max(tl.abs(x_grouped), axis=1)
     
     # Extract F32 exponent from absmax
-    # F32 format: sign(1) | exponent(8) | mantissa(23)
     absmax_bits = absmax.to(tl.int32, bitcast=True)
-    f32_exp = (absmax_bits >> 23) & 0xFF  # Biased exponent [0, 255]
+    f32_exp = (absmax_bits >> 23) & 0xFF
     
     # Compute E8M0 scale: scale = f32_exp - FP8_EXP_OFFSET
     scale_exp = f32_exp - FP8_EXP_OFFSET
-    
-    # Clamp to valid E8M0 range [0, 255]
     scale_exp = tl.maximum(scale_exp, 0)
     scale_exp = tl.minimum(scale_exp, 255)
     
-    # Store scale (as uint8)
-    scale_ptr_out = scale_ptr + pid_m * stride_sm + pid_g * stride_sg
-    tl.store(scale_ptr_out, scale_exp.to(tl.uint8))
-
-    scale_f32 = (scale_exp.to(tl.uint32) << 23)
+    # Store scales for each group
+    group_indices = tl.arange(0, GROUPS_PER_BLOCK)
+    scale_ptrs = scale_ptr + pid_m * stride_sm + (pid_g * GROUPS_PER_BLOCK + group_indices) * stride_sg
+    tl.store(scale_ptrs, scale_exp.to(tl.uint8), mask=(pid_g * GROUPS_PER_BLOCK + group_indices) < (K // GROUP_SIZE))
+    
+    # Broadcast scale_exp to match elements
+    scale_exp_expanded = tl.reshape(scale_exp, (GROUPS_PER_BLOCK, 1))
+    scale_exp_broadcast = tl.broadcast_to(scale_exp_expanded, (GROUPS_PER_BLOCK, GROUP_SIZE))
+    scale_exp_flat = tl.reshape(scale_exp_broadcast, (BLOCK_SIZE,)) 
+    
+    scale_f32 = (scale_exp_flat.to(tl.uint32) << 23)
     
     sr_seed = 0.0
     fp8 = tl.inline_asm_elementwise(
@@ -76,11 +89,102 @@ def f32_to_mxfp8_sr_kernel_hw(
         fp8 = tl.where(fp8 == 0x7F, 0x7E, fp8)
         fp8 = tl.where(fp8 == 0xFF, 0xFE, fp8)
 
-    out_ptr = out_ptr + pid_m * stride_outm + offsets * stride_outk
-    tl.store(out_ptr, fp8, mask=mask)
+    out_ptrs = out_ptr + pid_m * stride_outm + offsets * stride_outk
+    tl.store(out_ptrs, fp8, mask=mask)
 
 @triton.jit
-def f32_to_mxfp8_kernel_hw(
+def f32_to_mxfp8_e4m3_kernel_hw(
+    x_ptr,           
+    out_ptr,        
+    scale_ptr,      
+    M,              
+    K,              
+    stride_xm,       
+    stride_xk,      
+    stride_outm,     
+    stride_outk,    
+    stride_sm,      
+    stride_sg,      
+    GROUP_SIZE: tl.constexpr,
+    GROUPS_PER_BLOCK: tl.constexpr,  
+):
+    """
+    Triton kernel for F32 to MXFP8E4M3 conversion using hardware instructions.
+    Processes multiple groups per workgroup for better thread utilization.
+    """
+    pid_m = tl.program_id(0) 
+    pid_g = tl.program_id(1)  
+    
+    # Total elements per block = GROUP_SIZE * GROUPS_PER_BLOCK (e.g., 32 * 2 = 64)
+    BLOCK_SIZE: tl.constexpr = GROUP_SIZE * GROUPS_PER_BLOCK
+    
+    block_start = pid_g * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    
+    x_ptrs = x_ptr + pid_m * stride_xm + offsets * stride_xk
+    mask = offsets < K
+    x = tl.load(x_ptrs, mask=mask, other=0.0)
+    
+    # Reshape to [GROUPS_PER_BLOCK, GROUP_SIZE] to compute per-group absmax
+    x_grouped = tl.reshape(x, (GROUPS_PER_BLOCK, GROUP_SIZE))
+    
+    # Compute absmax for each group
+    absmax = tl.max(tl.abs(x_grouped), axis=1)
+    
+    # Extract F32 exponent from absmax
+    absmax_bits = absmax.to(tl.int32, bitcast=True)
+    f32_exp = (absmax_bits >> 23) & 0xFF
+    
+    # Compute E8M0 scale: scale = f32_exp - 8
+    scale_exp = f32_exp - 8
+    scale_exp = tl.maximum(scale_exp, 0)
+    scale_exp = tl.minimum(scale_exp, 255)
+    
+    # Store scales for each group
+    group_indices = tl.arange(0, GROUPS_PER_BLOCK)
+    scale_ptrs = scale_ptr + pid_m * stride_sm + (pid_g * GROUPS_PER_BLOCK + group_indices) * stride_sg
+    tl.store(scale_ptrs, scale_exp.to(tl.uint8), mask=(pid_g * GROUPS_PER_BLOCK + group_indices) < (K // GROUP_SIZE))
+    
+    # Broadcast scale_exp to match elements
+    # Each group has GROUP_SIZE//2 pairs
+    scale_exp_expanded = tl.reshape(scale_exp, (GROUPS_PER_BLOCK, 1))
+    scale_exp_broadcast = tl.broadcast_to(scale_exp_expanded, (GROUPS_PER_BLOCK, GROUP_SIZE // 2))
+    scale_exp_flat = tl.reshape(scale_exp_broadcast, (BLOCK_SIZE // 2,))
+    
+    scale_f32 = (scale_exp_flat.to(tl.uint32) << 23)
+    
+    # Get pairs of values from x
+    pair_offsets = tl.arange(0, BLOCK_SIZE // 2)
+    x_pairs = tl.reshape(x, (BLOCK_SIZE // 2, 2))
+    x_even, x_odd = tl.split(x_pairs) 
+    
+    fp8_packed = tl.inline_asm_elementwise(
+        "v_cvt_scalef32_pk_fp8_f32 $0, $1, $2, $3",
+        "=v,v,v,v",
+        args=[x_even, x_odd, scale_f32],
+        dtype=tl.uint32,
+        is_pure=True,
+        pack=1,
+    )
+    
+    # Extract individual FP8 bytes
+    fp8_0 = (fp8_packed & 0xFF).to(tl.uint8)
+    fp8_1 = ((fp8_packed >> 8) & 0xFF).to(tl.uint8)
+    
+    # Clamp NaN to max valid FP8 values
+    fp8_0 = tl.where(fp8_0 == 0x7F, 0x7E, fp8_0)
+    fp8_0 = tl.where(fp8_0 == 0xFF, 0xFE, fp8_0)
+    fp8_1 = tl.where(fp8_1 == 0x7F, 0x7E, fp8_1)
+    fp8_1 = tl.where(fp8_1 == 0xFF, 0xFE, fp8_1)
+
+    out_even_ptrs = out_ptr + pid_m * stride_outm + (block_start + pair_offsets * 2) * stride_outk
+    out_odd_ptrs = out_ptr + pid_m * stride_outm + (block_start + pair_offsets * 2 + 1) * stride_outk
+    tl.store(out_even_ptrs, fp8_0, mask=(block_start + pair_offsets * 2) < K)
+    tl.store(out_odd_ptrs, fp8_1, mask=(block_start + pair_offsets * 2 + 1) < K)
+
+
+@triton.jit
+def f32_to_mxfp8_e5m2_kernel_hw(
     x_ptr,           
     out_ptr,        
     scale_ptr,      
@@ -93,8 +197,6 @@ def f32_to_mxfp8_kernel_hw(
     stride_sm,      
     stride_sg,      
     GROUP_SIZE: tl.constexpr,  
-    FP8_EXP_OFFSET: tl.constexpr, 
-    IS_E4M3: tl.constexpr,     # True for e4m3, False for e5m2
 ):
     """
     Triton kernel for F32 to MXFP8 conversion using hardware instructions.
@@ -137,26 +239,14 @@ def f32_to_mxfp8_kernel_hw(
     # Split along last dim (size 2) → two tensors of shape [16]
     x_even, x_odd = tl.split(x_pairs)  # x_even: [16], x_odd: [16]
     
-    if IS_E4M3:
-        
-        fp8_packed = tl.inline_asm_elementwise(
-            "v_cvt_scalef32_pk_fp8_f32 $0, $1, $2, $3",
-            "=v,v,v,v",
-            args=[x_even, x_odd, scale_f32],
-            dtype=tl.uint32,
-            is_pure=True,
-            pack=1,
-        )
-    else:
-        fp8_packed = tl.inline_asm_elementwise(
-            "v_cvt_scalef32_pk_bf8_f32 $0, $1, $2, $3",
-            "=v,v,v,v",
-            args=[x_even, x_odd, scale_f32],
-            dtype=tl.uint32,
-            is_pure=True,
-            pack=1,
-        )
-    
+    fp8_packed = tl.inline_asm_elementwise(
+        "v_cvt_scalef32_pk_bf8_f32 $0, $1, $2, $3",
+        "=v,v,v,v",
+        args=[x_even, x_odd, scale_f32],
+        dtype=tl.uint32,
+        is_pure=True,
+        pack=1,
+    )
     
     # Extract individual FP8 bytes from the packed result
     # Lower byte = fp8(src0), Upper byte = fp8(src1)
@@ -164,26 +254,17 @@ def f32_to_mxfp8_kernel_hw(
     fp8_1 = ((fp8_packed >> 8) & 0xFF).to(tl.uint8)
     
     # Clamp NaN/Inf to max valid FP8 values
-    if IS_E4M3:
-        # e4m3: NaN is 0x7F (positive) or 0xFF (negative)
-        # Replace with max value 0x7E (448) or 0xFE (-448)
-        fp8_0 = tl.where(fp8_0 == 0x7F, 0x7E, fp8_0)
-        fp8_0 = tl.where(fp8_0 == 0xFF, 0xFE, fp8_0)
-        fp8_1 = tl.where(fp8_1 == 0x7F, 0x7E, fp8_1)
-        fp8_1 = tl.where(fp8_1 == 0xFF, 0xFE, fp8_1)
-    else:
-        # e5m2: Inf is 0x7C/0xFC, NaN is 0x7D-7F/0xFD-FF
-        # Replace with max value 0x7B (57344) or 0xFB (-57344)
-        fp8_0 = tl.where((fp8_0 >= 0x7C) & (fp8_0 < 0x80), 0x7B, fp8_0)
-        fp8_0 = tl.where(fp8_0 >= 0xFC, 0xFB, fp8_0)
-        fp8_1 = tl.where((fp8_1 >= 0x7C) & (fp8_1 < 0x80), 0x7B, fp8_1)
-        fp8_1 = tl.where(fp8_1 >= 0xFC, 0xFB, fp8_1)
+    # e5m2: Inf is 0x7C/0xFC, NaN is 0x7D-7F/0xFD-FF
+    # Replace with max value 0x7B (57344) or 0xFB (-57344)
+    fp8_0 = tl.where((fp8_0 >= 0x7C) & (fp8_0 < 0x80), 0x7B, fp8_0)
+    fp8_0 = tl.where(fp8_0 >= 0xFC, 0xFB, fp8_0)
+    fp8_1 = tl.where((fp8_1 >= 0x7C) & (fp8_1 < 0x80), 0x7B, fp8_1)
+    fp8_1 = tl.where(fp8_1 >= 0xFC, 0xFB, fp8_1)
 
     out_even_ptrs = out_ptr + pid_m * stride_outm + (group_start + pair_offsets * 2) * stride_outk
     out_odd_ptrs = out_ptr + pid_m * stride_outm + (group_start + pair_offsets * 2 + 1) * stride_outk
     tl.store(out_even_ptrs, fp8_0, mask=(group_start + pair_offsets * 2) < K)
     tl.store(out_odd_ptrs, fp8_1, mask=(group_start + pair_offsets * 2 + 1) < K)
-
 
 @triton.jit
 def f32_to_mxfp8_kernel_sw(
@@ -260,34 +341,50 @@ def f32_to_mxfp8_triton(x: torch.Tensor, fmt: str = "e4m3", group_size: int = 32
     
     scales = torch.empty((M, n_groups), dtype=torch.uint8, device=x.device)
     
-    grid = (M, n_groups)
+    # For packed HW kernel, process multiple groups per workgroup
+    GROUPS_PER_BLOCK = 8 
+    
     if method == 'hw':
         out_fp8 = torch.empty((M, K), dtype=torch.uint8, device=x.device)
-        
-        f32_to_mxfp8_kernel_hw[grid](
-            x, out_fp8, scales,
-            M, K,
-            x.stride(0), x.stride(1),
-            out_fp8.stride(0), out_fp8.stride(1),
-            scales.stride(0), scales.stride(1),
-            GROUP_SIZE=group_size,
-            FP8_EXP_OFFSET=fp8_exp_offset,
-            IS_E4M3=(fmt == "e4m3"),
-            num_warps=num_warps,
-        )
+        if fmt == "e4m3":
+            grid_hw = (M, n_groups // GROUPS_PER_BLOCK)
+            f32_to_mxfp8_e4m3_kernel_hw[grid_hw](
+                x, out_fp8, scales,
+                M, K,
+                x.stride(0), x.stride(1),
+                out_fp8.stride(0), out_fp8.stride(1),
+                scales.stride(0), scales.stride(1),
+                GROUP_SIZE=group_size,
+                GROUPS_PER_BLOCK=GROUPS_PER_BLOCK,
+                num_warps=num_warps,
+            )
+        else:
+            grid_e5m2 = (M, n_groups)
+            f32_to_mxfp8_e5m2_kernel_hw[grid_e5m2](
+                x, out_fp8, scales,
+                M, K,
+                x.stride(0), x.stride(1),
+                out_fp8.stride(0), out_fp8.stride(1),
+                scales.stride(0), scales.stride(1),
+                GROUP_SIZE=group_size,
+                num_warps=num_warps,
+            )
         
         fp8 = out_fp8.view(fp8_dtype)
 
     elif method == 'hw_sr':
         out_fp8 = torch.empty((M, K), dtype=torch.uint8, device=x.device)
+        GROUPS_PER_BLOCK_SR = 128
+        grid_sr = (M, n_groups // GROUPS_PER_BLOCK_SR)
         
-        f32_to_mxfp8_sr_kernel_hw[grid](
+        f32_to_mxfp8_sr_kernel_hw[grid_sr](
             x, out_fp8, scales,
             M, K,
             x.stride(0), x.stride(1),
             out_fp8.stride(0), out_fp8.stride(1),
             scales.stride(0), scales.stride(1),
             GROUP_SIZE=group_size,
+            GROUPS_PER_BLOCK=GROUPS_PER_BLOCK_SR,
             FP8_EXP_OFFSET=fp8_exp_offset,
             IS_E4M3=(fmt == "e4m3"),
             num_warps=num_warps,
@@ -297,8 +394,9 @@ def f32_to_mxfp8_triton(x: torch.Tensor, fmt: str = "e4m3", group_size: int = 32
 
     else:
         out_f32 = torch.empty((M, K), dtype=torch.float32, device=x.device)
+        grid_sw = (M, n_groups)
         
-        f32_to_mxfp8_kernel_sw[grid](
+        f32_to_mxfp8_kernel_sw[grid_sw](
             x, out_f32, scales,
             M, K,
             x.stride(0), x.stride(1),
@@ -324,7 +422,7 @@ def main():
     torch.manual_seed(123)
     
     M, N, K = 8192, 8192, 8192
-    BM, BN, BK = 256, 256, 128
+    BM, BN, BK = 128, 128, 128
     NUM_WARPS = 1
     
     # Create random F32 tensors (activations and weights)
