@@ -77,7 +77,7 @@ def f32_to_mxfp8_sr_kernel_hw(
             "v_cvt_scalef32_sr_fp8_f32 $0, $1, $2, $3",
             "=v,v,v,v",
             args=[x, sr_seed, scale_f32],
-            dtype=tl.uint32,
+            dtype=tl.uint16,
             is_pure=True,
             pack=1,
         )
@@ -157,12 +157,12 @@ def f32_to_mxfp8_e4m3_kernel_hw(
     pair_offsets = tl.arange(0, BLOCK_SIZE // 2)
     x_pairs = tl.reshape(x, (BLOCK_SIZE // 2, 2))
     x_even, x_odd = tl.split(x_pairs) 
-    
+
     fp8_packed = tl.inline_asm_elementwise(
         "v_cvt_scalef32_pk_fp8_f32 $0, $1, $2, $3",
         "=v,v,v,v",
         args=[x_even, x_odd, scale_f32],
-        dtype=tl.uint32,
+        dtype=tl.uint16,
         is_pure=True,
         pack=1,
     )
@@ -342,7 +342,7 @@ def f32_to_mxfp8_triton(x: torch.Tensor, fmt: str = "e4m3", group_size: int = 32
     scales = torch.empty((M, n_groups), dtype=torch.uint8, device=x.device)
     
     # For packed HW kernel, process multiple groups per workgroup
-    GROUPS_PER_BLOCK = 8 
+    GROUPS_PER_BLOCK = 16 
     
     if method == 'hw':
         out_fp8 = torch.empty((M, K), dtype=torch.uint8, device=x.device)
@@ -356,7 +356,7 @@ def f32_to_mxfp8_triton(x: torch.Tensor, fmt: str = "e4m3", group_size: int = 32
                 scales.stride(0), scales.stride(1),
                 GROUP_SIZE=group_size,
                 GROUPS_PER_BLOCK=GROUPS_PER_BLOCK,
-                num_warps=num_warps,
+                num_warps=2,
             )
         else:
             grid_e5m2 = (M, n_groups)
@@ -374,7 +374,7 @@ def f32_to_mxfp8_triton(x: torch.Tensor, fmt: str = "e4m3", group_size: int = 32
 
     elif method == 'hw_sr':
         out_fp8 = torch.empty((M, K), dtype=torch.uint8, device=x.device)
-        GROUPS_PER_BLOCK_SR = 128
+        GROUPS_PER_BLOCK_SR = 256
         grid_sr = (M, n_groups // GROUPS_PER_BLOCK_SR)
         
         f32_to_mxfp8_sr_kernel_hw[grid_sr](
@@ -387,7 +387,7 @@ def f32_to_mxfp8_triton(x: torch.Tensor, fmt: str = "e4m3", group_size: int = 32
             GROUPS_PER_BLOCK=GROUPS_PER_BLOCK_SR,
             FP8_EXP_OFFSET=fp8_exp_offset,
             IS_E4M3=(fmt == "e4m3"),
-            num_warps=num_warps,
+            num_warps=2,
         )
         
         fp8 = out_fp8.view(fp8_dtype)
@@ -422,7 +422,7 @@ def main():
     torch.manual_seed(123)
     
     M, N, K = 8192, 8192, 8192
-    BM, BN, BK = 128, 128, 128
+    BM, BN, BK = 256, 256, 128
     NUM_WARPS = 1
     
     # Create random F32 tensors (activations and weights)
