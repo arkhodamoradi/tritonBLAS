@@ -10,7 +10,21 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def f32_to_mxfp8_sr_kernel_hw(
+def get_exponent(x, offset):
+    absmax = tl.max(tl.abs(x), axis=1)
+    
+    # Extract F32 exponent from absmax
+    absmax_bits = absmax.to(tl.int32, bitcast=True)
+    f32_exp = (absmax_bits >> 23) & 0xFF
+    
+    # Compute E8M0 scale: scale = f32_exp - 8
+    _exp = f32_exp - offset
+    _exp = tl.maximum(_exp, 0)
+    _exo = tl.minimum(_exp, 255)
+    return _exp
+
+@triton.jit
+def f32_to_mxfp8_e4m3_sr_kernel_hw(
     x_ptr,           
     out_ptr,        
     scale_ptr,      
@@ -24,8 +38,6 @@ def f32_to_mxfp8_sr_kernel_hw(
     stride_sg,      
     GROUP_SIZE: tl.constexpr,
     GROUPS_PER_BLOCK: tl.constexpr,
-    FP8_EXP_OFFSET: tl.constexpr, 
-    IS_E4M3: tl.constexpr,     # True for e4m3, False for e5m2
 ):
     """
     Triton kernel for F32 to MXFP8 conversion using hardware instructions.
@@ -48,17 +60,7 @@ def f32_to_mxfp8_sr_kernel_hw(
     # Reshape to [GROUPS_PER_BLOCK, GROUP_SIZE] to compute per-group absmax
     x_grouped = tl.reshape(x, (GROUPS_PER_BLOCK, GROUP_SIZE))
     
-    # Compute absmax for each group
-    absmax = tl.max(tl.abs(x_grouped), axis=1)
-    
-    # Extract F32 exponent from absmax
-    absmax_bits = absmax.to(tl.int32, bitcast=True)
-    f32_exp = (absmax_bits >> 23) & 0xFF
-    
-    # Compute E8M0 scale: scale = f32_exp - FP8_EXP_OFFSET
-    scale_exp = f32_exp - FP8_EXP_OFFSET
-    scale_exp = tl.maximum(scale_exp, 0)
-    scale_exp = tl.minimum(scale_exp, 255)
+    scale_exp = get_exponent(x_grouped, 8)
     
     # Store scales for each group
     group_indices = tl.arange(0, GROUPS_PER_BLOCK)
@@ -83,11 +85,10 @@ def f32_to_mxfp8_sr_kernel_hw(
         )
     
     fp8 = fp8.to(tl.uint8)
-    if IS_E4M3:
-        # e4m3: NaN is 0x7F (positive) or 0xFF (negative)
-        # Replace with max value 0x7E (448) or 0xFE (-448)
-        fp8 = tl.where(fp8 == 0x7F, 0x7E, fp8)
-        fp8 = tl.where(fp8 == 0xFF, 0xFE, fp8)
+    
+    # e4m3: NaN is 0x7F (positive) or 0xFF (negative)
+    # Replace with max value 0x7E (448) or 0xFE (-448)
+    fp8 = tl.where((fp8 & 0x7F) == 0x7F, fp8 - 1, fp8)
 
     out_ptrs = out_ptr + pid_m * stride_outm + offsets * stride_outk
     tl.store(out_ptrs, fp8, mask=mask)
@@ -128,17 +129,7 @@ def f32_to_mxfp8_e4m3_kernel_hw(
     # Reshape to [GROUPS_PER_BLOCK, GROUP_SIZE] to compute per-group absmax
     x_grouped = tl.reshape(x, (GROUPS_PER_BLOCK, GROUP_SIZE))
     
-    # Compute absmax for each group
-    absmax = tl.max(tl.abs(x_grouped), axis=1)
-    
-    # Extract F32 exponent from absmax
-    absmax_bits = absmax.to(tl.int32, bitcast=True)
-    f32_exp = (absmax_bits >> 23) & 0xFF
-    
-    # Compute E8M0 scale: scale = f32_exp - 8
-    scale_exp = f32_exp - 8
-    scale_exp = tl.maximum(scale_exp, 0)
-    scale_exp = tl.minimum(scale_exp, 255)
+    scale_exp = get_exponent(x_grouped, 8)
     
     # Store scales for each group
     group_indices = tl.arange(0, GROUPS_PER_BLOCK)
@@ -172,10 +163,8 @@ def f32_to_mxfp8_e4m3_kernel_hw(
     fp8_1 = ((fp8_packed >> 8) & 0xFF).to(tl.uint8)
     
     # Clamp NaN to max valid FP8 values
-    fp8_0 = tl.where(fp8_0 == 0x7F, 0x7E, fp8_0)
-    fp8_0 = tl.where(fp8_0 == 0xFF, 0xFE, fp8_0)
-    fp8_1 = tl.where(fp8_1 == 0x7F, 0x7E, fp8_1)
-    fp8_1 = tl.where(fp8_1 == 0xFF, 0xFE, fp8_1)
+    fp8_0 = tl.where((fp8_0 & 0x7F) == 0x7F, fp8_0 - 1, fp8_0)
+    fp8_1 = tl.where((fp8_1 & 0x7F) == 0x7F, fp8_1 - 1, fp8_1)
 
     out_even_ptrs = out_ptr + pid_m * stride_outm + (block_start + pair_offsets * 2) * stride_outk
     out_odd_ptrs = out_ptr + pid_m * stride_outm + (block_start + pair_offsets * 2 + 1) * stride_outk
@@ -218,8 +207,8 @@ def f32_to_mxfp8_e5m2_kernel_hw(
     absmax_bits = absmax.to(tl.int32, bitcast=True)
     f32_exp = (absmax_bits >> 23) & 0xFF  # Biased exponent [0, 255]
     
-    # Compute E8M0 scale: scale = f32_exp - FP8_EXP_OFFSET
-    scale_exp = f32_exp - FP8_EXP_OFFSET
+    # Compute E8M0 scale: scale = f32_exp
+    scale_exp = f32_exp - 16
     
     # Clamp to valid E8M0 range [0, 255]
     scale_exp = tl.maximum(scale_exp, 0)
@@ -336,7 +325,7 @@ def f32_to_mxfp8_triton(x: torch.Tensor, fmt: str = "e4m3", group_size: int = 32
         fp8_dtype = torch.float8_e4m3fn
     else:  # e5m2
         fp8_max = 57344.0
-        fp8_exp_offset = 15
+        fp8_exp_offset = 16
         fp8_dtype = torch.float8_e5m2
     
     scales = torch.empty((M, n_groups), dtype=torch.uint8, device=x.device)
@@ -367,6 +356,7 @@ def f32_to_mxfp8_triton(x: torch.Tensor, fmt: str = "e4m3", group_size: int = 32
                 out_fp8.stride(0), out_fp8.stride(1),
                 scales.stride(0), scales.stride(1),
                 GROUP_SIZE=group_size,
+                GROUPS_PER_BLOCK=GROUPS_PER_BLOCK,
                 num_warps=num_warps,
             )
         
@@ -377,18 +367,17 @@ def f32_to_mxfp8_triton(x: torch.Tensor, fmt: str = "e4m3", group_size: int = 32
         GROUPS_PER_BLOCK_SR = 256
         grid_sr = (M, n_groups // GROUPS_PER_BLOCK_SR)
         
-        f32_to_mxfp8_sr_kernel_hw[grid_sr](
-            x, out_fp8, scales,
-            M, K,
-            x.stride(0), x.stride(1),
-            out_fp8.stride(0), out_fp8.stride(1),
-            scales.stride(0), scales.stride(1),
-            GROUP_SIZE=group_size,
-            GROUPS_PER_BLOCK=GROUPS_PER_BLOCK_SR,
-            FP8_EXP_OFFSET=fp8_exp_offset,
-            IS_E4M3=(fmt == "e4m3"),
-            num_warps=2,
-        )
+        if fmt == "e4m3":
+            f32_to_mxfp8_e4m3_sr_kernel_hw[grid_sr](
+                x, out_fp8, scales,
+                M, K,
+                x.stride(0), x.stride(1),
+                out_fp8.stride(0), out_fp8.stride(1),
+                scales.stride(0), scales.stride(1),
+                GROUP_SIZE=group_size,
+                GROUPS_PER_BLOCK=GROUPS_PER_BLOCK_SR,
+                num_warps=num_warps,
+            )
         
         fp8 = out_fp8.view(fp8_dtype)
 
