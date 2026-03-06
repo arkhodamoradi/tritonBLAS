@@ -345,7 +345,7 @@ def f32_to_mxfp8_triton(x: torch.Tensor, fmt: str = "e4m3", group_size: int = 32
                 scales.stride(0), scales.stride(1),
                 GROUP_SIZE=group_size,
                 GROUPS_PER_BLOCK=GROUPS_PER_BLOCK,
-                num_warps=2,
+                num_warps=num_warps,
             )
         else:
             grid_e5m2 = (M, n_groups)
