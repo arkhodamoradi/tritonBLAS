@@ -241,9 +241,9 @@ def print_kernel_summary():
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=8),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=8),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=8),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=8),
+        # triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        # triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        # triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
         # triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 4}, num_stages=3, num_warps=4),
         # triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 4}, num_stages=3, num_warps=4),
         # triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 4}, num_stages=3, num_warps=2),
@@ -695,6 +695,7 @@ def _is_hip():
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_I': 64, 'BLOCK_J': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=8),
+        # triton.Config({'BLOCK_I': 64, 'BLOCK_J': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=4),
         # triton.Config({'BLOCK_I': 32, 'BLOCK_J': 32, 'BLOCK_K': 32}, num_stages=2, num_warps=4),
         # triton.Config({'BLOCK_I': 64, 'BLOCK_J': 64, 'BLOCK_K': 64}, num_stages=2, num_warps=4),
         # triton.Config({'BLOCK_I': 32, 'BLOCK_J': 64, 'BLOCK_K': 32}, num_stages=2, num_warps=4),
@@ -1363,272 +1364,392 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
             self.c_z, self.c_hidden, **linear_init_params.linear_b_g
         )
 
-    def _inference_forward(
-        self,
-        z: torch.Tensor,
-        mask: torch.Tensor | None = None,
-        inplace_chunk_size: int | None = None,
-        with_add: bool = True,
-    ):
-        """
-        Args:
-            z:
-                A [*, N, N, C_z] pair representation
-            mask:
-                A [*, N, N] pair mask
-            inplace_chunk_size:
-                Size of chunks used in the main computation. Increase to trade
-                memory for speed.
-            with_add:
-                If True, z is overwritten with (z + update). Otherwise, it is
-                overwritten with (update).
-        Returns:
-            A reference to the overwritten z
+    # def _inference_forward(
+    #     self,
+    #     z: torch.Tensor,
+    #     mask: torch.Tensor | None = None,
+    #     inplace_chunk_size: int | None = None,
+    #     with_add: bool = True,
+    # ):
+    #     """
+    #     Triton-optimized memory-efficient inference forward.
+        
+    #     Uses Triton kernels for:
+    #     1. Fused LayerNorm + GEMM + sigmoid + multiply for projections
+    #     2. Batched GEMM for matrix multiplication
+    #     3. Fused final projection
+        
+    #     While preserving the memory-efficient chunked design.
+    #     """
+    #     if mask is None:
+    #         mask = z.new_ones(z.shape[:-1])
 
-        More memory-efficient, inference-only version of the forward function.
-        Uses in-place operations, fusion of the addition that happens after
-        this module in the Evoformer, a smidge of recomputation, and
-        a cache of overwritten values to lower peak memory consumption of this
-        module from 5x the size of the input tensor z to 2.5x its size. Useful
-        for inference on extremely long sequences.
+    #     mask = mask.unsqueeze(-1)
+        
+    #     # Get dimensions
+    #     *batch_dims, N, _, c_z = z.shape
+    #     c_hidden = self.c_hidden
+        
+    #     # Calculate batch size
+    #     Bflat = 1
+    #     for d in batch_dims:
+    #         Bflat *= d
 
-        It works as follows. We will make reference to variables used in the
-        default forward implementation below. Naively, triangle multiplication
-        attention requires the manifestation of 5 tensors the size of z:
-        1) z, the "square" input tensor, 2) a, the first projection of z,
-        3) b, the second projection of b, 4) g, a z-sized mask, and 5) a
-        z-sized tensor for intermediate computations. For large N, this is
-        prohibitively expensive; for N=4000, for example, z is more than 8GB
-        alone. To avoid this problem, we compute b, g, and all intermediate
-        tensors in small chunks, noting that the chunks required to compute a
-        chunk of the output depend only on the tensor a and corresponding
-        vertical and horizontal chunks of z. This suggests an algorithm that
-        loops over pairs of chunks of z: hereafter "columns" and "rows" of
-        z, even though each "column" and "row" in fact contains
-        inplace_chunk_size contiguous true columns and rows of z. Writing
-        output chunks to a new tensor would bring total memory consumption
-        down to 3x the size of z. However, more memory can be saved by writing
-        output chunks directly to z in-place. WLOG, we choose to write output
-        chunks vertically, overwriting the ith "column" of z at the end of
-        the ith iteration of the main loop. Despite this overwriting, the
-        ith column is always one column ahead of previously overwritten columns
-        and can be recovered directly from z. After the first iteration,
-        however, the ith row of z is always at least partially overwritten. For
-        this reason, we introduce the z-cache, a tensor one-half the size of
-        z. The z-cache initially contains the left half (2nd and 3rd quadrants)
-        of z. For 0 < i < N/2, the missing left part of the ith row of z is
-        recovered from this cache at the beginning of the ith iteration. Once i
-        exceeds n/2, the cache is "reoriented" to encompass the 3rd and 4th
-        quadrants of z instead. Though the 3rd quadrant of the original z is
-        entirely overwritten at this point, it can be recovered from the z-cache
-        itself. Thereafter, the ith row of z can be recovered in its entirety
-        from the reoriented z-cache. After the final iteration, z has been
-        completely overwritten and contains the triangular multiplicative
-        update. If with_add is True, it instead contains the sum of z and the
-        triangular multiplicative update. In either case, peak memory
-        consumption is just 2.5x the size of z, disregarding memory used for
-        chunks and other small variables.
-        """
-        if mask is None:
-            mask = z.new_ones(z.shape[:-1])
+    #     # Concatenate weights for fused kernels
+    #     W_a_gp = torch.cat([self.linear_a_g.weight.T, self.linear_a_p.weight.T], dim=1)
+    #     W_b_gp = torch.cat([self.linear_b_g.weight.T, self.linear_b_p.weight.T], dim=1)
+        
+    #     # Concatenate biases if they exist
+    #     bias_a_gp = None
+    #     if self.linear_a_g.bias is not None and self.linear_a_p.bias is not None:
+    #         bias_a_gp = torch.cat([self.linear_a_g.bias, self.linear_a_p.bias])
+        
+    #     bias_b_gp = None
+    #     if self.linear_b_g.bias is not None and self.linear_b_p.bias is not None:
+    #         bias_b_gp = torch.cat([self.linear_b_g.bias, self.linear_b_p.bias])
 
-        mask = mask.unsqueeze(-1)
+    #     # Get layer norm parameters
+    #     ln_weight = self.layer_norm_in.weight
+    #     ln_bias = self.layer_norm_in.bias
 
-        def compute_projection_helper(pair, mask, a=True):
-            if a:
-                linear_g = self.linear_a_g
-                linear_p = self.linear_a_p
-            else:
-                linear_g = self.linear_b_g
-                linear_p = self.linear_b_p
+    #     def compute_projection_triton(pair, mask_chunk, is_a=True):
+    #         """
+    #         Triton-optimized projection computation.
+    #         Uses fused LayerNorm + GEMM + sigmoid + multiply kernel.
+            
+    #         Args:
+    #             pair: [*, chunk_size, N, c_z] or [*, N, chunk_size, c_z] input
+    #             mask_chunk: corresponding mask
+    #             is_a: whether this is the 'a' projection
+            
+    #         Returns:
+    #             [*, c_hidden, chunk_size, N] or [*, c_hidden, N, chunk_size] projection
+    #         """
+    #         # Get the appropriate weights
+    #         W_gp = W_a_gp if is_a else W_b_gp
+    #         bias_gp = bias_a_gp if is_a else bias_b_gp
+            
+    #         # Get shape info
+    #         orig_shape = pair.shape
+    #         chunk_N1 = orig_shape[-3]  # chunk_size or N
+    #         chunk_N2 = orig_shape[-2]  # N or chunk_size
+            
+    #         # Flatten to 2D: [batch*chunk_N1*chunk_N2, c_z]
+    #         pair_flat = pair.reshape(-1, c_z)
+    #         mask_flat = mask_chunk.reshape(-1)
+    #         N_rows = pair_flat.shape[0]
+            
+    #         # Allocate output in channel-major format [Bflat*c_hidden, chunk_N1, chunk_N2]
+    #         out_channel_major = torch.empty(Bflat * c_hidden, chunk_N1, chunk_N2, 
+    #                                        device=pair.device, dtype=pair.dtype)
+            
+    #         # Grid for fused computation
+    #         def grid(meta):
+    #             return (
+    #                 triton.cdiv(N_rows, meta['BLOCK_M']),
+    #                 triton.cdiv(c_hidden, meta['BLOCK_N']),
+    #             )
+            
+    #         # Launch fused kernel
+    #         fused_layernorm_gemm_sigmoid_multiply_channel_major[grid](
+    #             pair_flat, W_gp,
+    #             out_channel_major,
+    #             bias_gp,
+    #             mask_flat,
+    #             ln_weight, ln_bias,
+    #             0, pair_flat.stride(0), pair_flat.stride(1),
+    #             W_gp.stride(0), W_gp.stride(1),
+    #             out_channel_major.stride(0), out_channel_major.stride(1), out_channel_major.stride(2),
+    #             N_rows, c_z, c_hidden,
+    #             Bflat, chunk_N1,  # Note: using chunk_N1 as spatial dim
+    #             1e-5,
+    #         )
+            
+    #         # Reshape to [*, c_hidden, chunk_N1, chunk_N2]
+    #         result = out_channel_major.reshape(*batch_dims, c_hidden, chunk_N1, chunk_N2)
+            
+    #         # Apply direction-specific transpose
+    #         need_transpose = self._outgoing ^ is_a
+    #         if need_transpose:
+    #             result = result.transpose(-1, -2)
+            
+    #         return result
 
-            pair = self.layer_norm_in(pair)
-            p = linear_g(pair)
-            p.sigmoid_()
-            p *= linear_p(pair)
-            p *= mask
-            p = permute_final_dims(p, (2, 0, 1))
-            return p
+    #     def compute_projection_chunked_triton(pair, mask_tensor, is_a=True):
+    #         """Chunked version of Triton projection for memory efficiency."""
+    #         linear_g = self.linear_a_g if is_a else self.linear_b_g
+    #         c = linear_g.weight.shape[-2]
+    #         need_transpose = self._outgoing ^ is_a
+            
+    #         out_shape = pair.shape[:-3] + (c,) + pair.shape[-3:-1]
+    #         p = pair.new_zeros(out_shape)
+            
+    #         for i in range(0, pair.shape[-3], inplace_chunk_size):
+    #             pair_chunk = pair[..., i : i + inplace_chunk_size, :, :]
+    #             mask_chunk = mask_tensor[..., i : i + inplace_chunk_size, :, :]
+                
+    #             # Use Triton kernel for this chunk
+    #             p_chunk = compute_projection_triton(pair_chunk, mask_chunk, is_a)
+                
+    #             if need_transpose:
+    #                 p[..., i : i + inplace_chunk_size] = p_chunk
+    #             else:
+    #                 p[..., i : i + inplace_chunk_size, :] = p_chunk
+                
+    #             del pair_chunk, p_chunk
+            
+    #         return p
 
-        def compute_projection(pair, mask, a=True, chunked=True):
-            need_transpose = self._outgoing ^ a
-            if not chunked:
-                p = compute_projection_helper(pair, mask, a)
-                if need_transpose:
-                    p = p.transpose(-1, -2)
-            else:
-                # This computation is chunked so as not to exceed our 2.5x
-                # budget with a large intermediate tensor
-                linear_g = self.linear_a_g if a else self.linear_b_g
-                c = linear_g.weight.shape[-2]
-                out_shape = pair.shape[:-3] + (c,) + pair.shape[-3:-1]
-                p = pair.new_zeros(out_shape)
-                for i in range(0, pair.shape[-3], inplace_chunk_size):
-                    pair_chunk = compute_projection_helper(
-                        pair[..., i : i + inplace_chunk_size, :, :],
-                        mask[..., i : i + inplace_chunk_size, :, :],
-                        a,
-                    )
-                    if need_transpose:
-                        pair_chunk = pair_chunk.transpose(-1, -2)
-                        p[..., i : i + inplace_chunk_size] = pair_chunk
-                    else:
-                        p[..., i : i + inplace_chunk_size, :] = pair_chunk
+    #     # Compute 'a' projection using Triton (chunked for memory efficiency)
+    #     a = compute_projection_chunked_triton(z, mask, is_a=True)
 
-                    del pair_chunk
+    #     if inplace_chunk_size is not None:
+    #         n = a.shape[-1]
+    #         half_n = n // 2 + n % 2
+    #         row_dim = -3
+    #         col_dim = -2
+    #         b_chunk_dim = row_dim if self._outgoing else col_dim
 
-            return p
+    #         def empty_slicer(t):
+    #             return [slice(None) for _ in t.shape]
 
-        # We start by fully manifesting a. In addition to the input, this
-        # brings total memory consumption to 2x z (disregarding size of chunks)
-        # [*, N, N, c]
-        a = compute_projection(z, mask, True, chunked=True)
+    #         def slice_tensor(t, start, end, dim):
+    #             s = empty_slicer(t)
+    #             s[dim] = slice(start, end)
+    #             return t[tuple(s)]
 
-        if inplace_chunk_size is not None:
-            n = a.shape[-1]
-            half_n = n // 2 + n % 2
-            row_dim = -3
-            col_dim = -2
-            b_chunk_dim = row_dim if self._outgoing else col_dim
+    #         def flip_z_cache_(z_cache, z):
+    #             quadrant_3 = slice_tensor(z_cache, half_n, None, row_dim)
+    #             z_cache = z_cache.transpose(row_dim, col_dim)
+    #             z_cache = z_cache[..., : (n // 2), :, :]
+    #             first_half_slicer = empty_slicer(z_cache)
+    #             first_half_slicer[col_dim] = slice(0, half_n)
+    #             z_cache[tuple(first_half_slicer)] = quadrant_3
+    #             quadrant_4 = slice_tensor(z, half_n, None, row_dim)
+    #             quadrant_4 = slice_tensor(quadrant_4, half_n, None, col_dim)
+    #             quadrant_3_slicer = empty_slicer(z_cache)
+    #             quadrant_3_slicer[col_dim] = slice(half_n, None)
+    #             z_cache[tuple(quadrant_3_slicer)] = quadrant_4
+    #             return z_cache
 
-            def empty_slicer(t):
-                return [slice(None) for _ in t.shape]
+    #         # Initialize z cache
+    #         z_cache_shape = list(z.shape)
+    #         z_cache_shape[col_dim] = half_n
+    #         z_cache = z.new_zeros(z_cache_shape)
+    #         z_cache_slicer = empty_slicer(z_cache)
+    #         z_cache_slicer[col_dim] = slice(0, half_n)
+    #         z_cache.copy_(z[tuple(z_cache_slicer)])
+    #         z_cache_rotated = False
 
-            def slice_tensor(t, start, end, dim):
-                # Slices start:end from the dim dimension of t
-                s = empty_slicer(t)
-                s[dim] = slice(start, end)
-                return t[tuple(s)]
+    #         i_range = list(range(0, half_n, inplace_chunk_size))
+    #         initial_offsets = [
+    #             i_2 - i_1
+    #             for i_1, i_2 in zip(i_range, i_range[1:] + [half_n], strict=True)
+    #         ]
+    #         after_half = list(range(half_n, n, inplace_chunk_size))
+    #         after_half_offsets = [inplace_chunk_size for _ in after_half]
+    #         combined_range_with_offsets = zip(
+    #             i_range + after_half, initial_offsets + after_half_offsets, strict=False
+    #         )
+            
+    #         for i, offset in combined_range_with_offsets:
+    #             if not z_cache_rotated and i >= half_n:
+    #                 z_cache = flip_z_cache_(z_cache, z)
+    #                 z_cache_rotated = True
 
-            def flip_z_cache_(z_cache, z):
-                # "Reorient" the z_cache (see below), filling it with quadrants
-                # 3---recovered from the z_cache---and 4---recovered from z---
-                # of the input tensor z.
-                quadrant_3 = slice_tensor(z_cache, half_n, None, row_dim)
-                z_cache = z_cache.transpose(row_dim, col_dim)
+    #             z_chunk_b = slice_tensor(z, i, i + offset, b_chunk_dim)
+    #             mask_chunk = slice_tensor(mask, i, i + offset, b_chunk_dim)
 
-                # If n is odd, we need to shrink the z_cache by one row
-                z_cache = z_cache[..., : (n // 2), :, :]
+    #             z_chunk_b = z_chunk_b.clone()
+    #             if b_chunk_dim == col_dim:
+    #                 z_chunk_b = slice_tensor(z, i, i + offset, col_dim)
+    #             else:
+    #                 if not z_cache_rotated:
+    #                     z_chunk_slicer = empty_slicer(z_chunk_b)
+    #                     z_chunk_slicer[col_dim] = slice(0, half_n)
+    #                     z_chunk_b[tuple(z_chunk_slicer)] = slice_tensor(
+    #                         z_cache, i, i + offset, row_dim,
+    #                     )
+    #                 else:
+    #                     z_cache_offset = i - half_n
+    #                     z_chunk_b = slice_tensor(
+    #                         z_cache, z_cache_offset, z_cache_offset + offset, row_dim
+    #                     )
 
-                # Move the 3rd quadrant of z into the
-                first_half_slicer = empty_slicer(z_cache)
-                first_half_slicer[col_dim] = slice(0, half_n)
-                z_cache[tuple(first_half_slicer)] = quadrant_3
+    #             # Use Triton for b_chunk projection
+    #             b_chunk = compute_projection_triton(z_chunk_b, mask_chunk, is_a=False)
+    #             del z_chunk_b
 
-                # Get the fourth quadrant of z
-                quadrant_4 = slice_tensor(z, half_n, None, row_dim)
-                quadrant_4 = slice_tensor(quadrant_4, half_n, None, col_dim)
+    #             # Use Triton batched GEMM for a @ b_chunk
+    #             # a is [*, c_hidden, N, N], b_chunk is [*, c_hidden, N, offset] or similar
+    #             # We need to use triton_combine_projection which expects [B*C, N, N] format
+                
+    #             # Reshape a and b_chunk for Triton GEMM
+    #             # a: [*, c_hidden, N, N] -> [B*c_hidden, N, N]
+    #             a_flat = a.reshape(-1, a.shape[-2], a.shape[-1])
+    #             b_chunk_flat = b_chunk.reshape(-1, b_chunk.shape[-2], b_chunk.shape[-1])
+                
+    #             # Use Triton batched GEMM
+    #             BC = a_flat.shape[0]
+    #             M_dim = a_flat.shape[1]
+    #             K_dim = a_flat.shape[2]
+    #             N_dim = b_chunk_flat.shape[2]
+                
+    #             x_chunk_flat = torch.empty(BC, M_dim, N_dim, device=a_flat.device, dtype=a_flat.dtype)
+                
+    #             channels_per_batch = 1
+    #             num_batches = BC
+                
+    #             def grid_gemm(meta):
+    #                 num_m_tiles = triton.cdiv(M_dim, meta['BLOCK_M'])
+    #                 num_n_tiles = triton.cdiv(N_dim, meta['BLOCK_N'])
+    #                 total_tiles = num_m_tiles * num_n_tiles 
+    #                 return (num_batches, total_tiles)
+                
+    #             batched_gemm_multi_channel[grid_gemm](
+    #                 a_flat, b_chunk_flat, x_chunk_flat,
+    #                 a_flat.stride(0), a_flat.stride(1), a_flat.stride(2),
+    #                 b_chunk_flat.stride(0), b_chunk_flat.stride(1), b_chunk_flat.stride(2),
+    #                 x_chunk_flat.stride(0), x_chunk_flat.stride(1), x_chunk_flat.stride(2),
+    #                 M_dim, K_dim, N_dim,
+    #                 BC, channels_per_batch,
+    #             )
+                
+    #             # Reshape back and permute: [B*c_hidden, N, offset] -> [*, offset, N, c_hidden]
+    #             x_chunk = x_chunk_flat.reshape(*batch_dims, c_hidden, M_dim, N_dim)
+    #             x_chunk = permute_final_dims(x_chunk, (1, 2, 0))
+                
+    #             # Fused final projection using Triton kernel
+    #             # x_chunk is [*, offset, N, c_hidden], need to apply:
+    #             # x = layer_norm_out(x_chunk)
+    #             # x = linear_z(x)
+    #             # g = sigmoid(linear_g(layer_norm_in(z_chunk_g)))
+    #             # x *= g
+                
+    #             # Get z_chunk_g for gate computation
+    #             z_chunk_g = slice_tensor(z, i, i + offset, col_dim)
+                
+    #             # Flatten for fused kernel
+    #             x_chunk_shape = x_chunk.shape
+    #             x_chunk_flat_2d = x_chunk.reshape(-1, c_hidden)
+    #             z_chunk_g_flat = z_chunk_g.reshape(-1, c_z)
+    #             N_rows_chunk = x_chunk_flat_2d.shape[0]
+                
+    #             # Get layer norm parameters
+    #             ln_out_weight = self.layer_norm_out.weight
+    #             ln_out_bias = self.layer_norm_out.bias
+                
+    #             # Output tensor
+    #             output_chunk_flat = torch.empty(N_rows_chunk, c_z, device=x_chunk.device, dtype=x_chunk.dtype)
+                
+    #             # Grid for fused computation
+    #             def grid_final(meta):
+    #                 return (
+    #                     triton.cdiv(N_rows_chunk, meta['BLOCK_M']),
+    #                     triton.cdiv(c_z, meta['BLOCK_N']),
+    #                 )
+                
+    #             # Get weight and bias pointers
+    #             W_g = self.linear_g.weight.T
+    #             W_z = self.linear_z.weight.T
+    #             bias_g_final = self.linear_g.bias if self.linear_g.bias is not None else None
+    #             bias_z_final = self.linear_z.bias if self.linear_z.bias is not None else None
+                
+    #             # Use fused kernel: sigmoid(layer_norm_in(z_chunk_g) @ W_g) * (layer_norm_out(x_chunk) @ W_z)
+    #             fused_layernorm_gemm_sigmoid_multiply[grid_final](
+    #                 z_chunk_g_flat,  # A for gate (needs layer_norm_in)
+    #                 x_chunk_flat_2d,  # A_p for proj (needs layer_norm_out)
+    #                 W_g, W_z,
+    #                 output_chunk_flat,
+    #                 bias_g_final, bias_z_final,
+    #                 ln_out_weight, ln_out_bias,  # LayerNorm parameters for x_chunk (layer_norm_out)
+    #                 z_chunk_g_flat.stride(0), z_chunk_g_flat.stride(1),
+    #                 x_chunk_flat_2d.stride(0), x_chunk_flat_2d.stride(1),
+    #                 W_g.stride(0), W_g.stride(1),
+    #                 W_z.stride(0), W_z.stride(1),
+    #                 output_chunk_flat.stride(0), output_chunk_flat.stride(1),
+    #                 N_rows_chunk, c_z, c_hidden, c_z,
+    #                 1e-5,
+    #             )
+                
+    #             # Reshape back
+    #             x_chunk = output_chunk_flat.reshape(*x_chunk_shape[:-1], c_z)
+    #             del z_chunk_g
 
-                # Insert said quadrant into the rotated z-cache
-                quadrant_3_slicer = empty_slicer(z_cache)
-                quadrant_3_slicer[col_dim] = slice(half_n, None)
+    #             z_slicer = empty_slicer(z)
+    #             z_slicer[col_dim] = slice(i, i + offset)
+    #             if with_add:
+    #                 z[tuple(z_slicer)] += x_chunk
+    #             else:
+    #                 z[tuple(z_slicer)] = x_chunk
+    #     else:
+    #         # Non-chunked path - use Triton for b projection
+    #         b = compute_projection_triton(z, mask, is_a=False)
+    #         x = torch.einsum("...ij,...jk->...ik", a, b)
+    #         x = self.layer_norm_out(x)
+    #         x = self.linear_z(x)
+    #         g = self.linear_g(z)
+    #         g.sigmoid_()
+    #         x *= g
+    #         if with_add:
+    #             z += x
+    #         else:
+    #             z = x
 
-                z_cache[tuple(quadrant_3_slicer)] = quadrant_4
+    #     return z
+    # def _inference_forward(
+    #     self,
+    #     z: torch.Tensor,
+    #     mask: torch.Tensor | None = None,
+    #     _inplace_chunk_size: int | None = None,
+    #     with_add: bool = True,
+    # ):
+    #     """
+    #     Args:
+    #         z:
+    #             A [*, N, N, C_z] pair representation
+    #         mask:
+    #             A [*, N, N] pair mask
+    #         with_add:
+    #             If True, z is overwritten with (z + update). Otherwise, it is
+    #             overwritten with (update).
+    #     Returns:
+    #         A reference to the overwritten z
+    #     """
+    #     if mask is None:
+    #         mask = z.new_ones(z.shape[:-1])
 
-                return z_cache
+    #     mask = mask.unsqueeze(-1)
 
-            # Initialize the z cache to the left half of z.
-            z_cache_shape = list(z.shape)
-            z_cache_shape[col_dim] = half_n
-            z_cache = z.new_zeros(z_cache_shape)
-            z_cache_slicer = empty_slicer(z_cache)
-            z_cache_slicer[col_dim] = slice(0, half_n)
-            z_cache.copy_(z[tuple(z_cache_slicer)])
-            z_cache_rotated = False
+    #     def compute_projection_helper(pair, mask):
+    #         p = self.linear_ab_g(pair)
+    #         p.sigmoid_()
+    #         p *= self.linear_ab_p(pair)
+    #         p *= mask
 
-            # We need to reorient the z-cache at the halfway point, and we
-            # don't want a single chunk to straddle that point. We contract one
-            # of the chunks in the middle to address that problem.
-            i_range = list(range(0, half_n, inplace_chunk_size))
-            initial_offsets = [
-                i_2 - i_1
-                for i_1, i_2 in zip(i_range, i_range[1:] + [half_n], strict=True)
-            ]
-            after_half = list(range(half_n, n, inplace_chunk_size))
-            after_half_offsets = [inplace_chunk_size for _ in after_half]
-            combined_range_with_offsets = zip(
-                i_range + after_half, initial_offsets + after_half_offsets, strict=False
-            )
-            for i, offset in combined_range_with_offsets:
-                if not z_cache_rotated and i >= half_n:
-                    z_cache = flip_z_cache_(z_cache, z)
-                    z_cache_rotated = True
+    #         return p
 
-                z_chunk_b = slice_tensor(
-                    z,
-                    i,
-                    i + offset,
-                    b_chunk_dim,
-                )
-                mask_chunk = slice_tensor(
-                    mask,
-                    i,
-                    i + offset,
-                    b_chunk_dim,
-                )
+    #     def compute_projection(pair, mask):
+    #         p = compute_projection_helper(pair, mask)
+    #         left = p[..., : self.c_hidden]
+    #         right = p[..., self.c_hidden :]
 
-                z_chunk_b = z_chunk_b.clone()
-                if b_chunk_dim == col_dim:
-                    z_chunk_b = slice_tensor(z, i, i + offset, col_dim)
-                else:  # b_chunk_dim == row_dim
-                    # In this case, the b-dimension (b_chunk_dim) is partially
-                    # overwritten at the end of each iteration. We need to
-                    # restore the missing component from the z-cache.
-                    if not z_cache_rotated:
-                        z_chunk_slicer = empty_slicer(z_chunk_b)
-                        z_chunk_slicer[col_dim] = slice(0, half_n)
-                        z_chunk_b[tuple(z_chunk_slicer)] = slice_tensor(
-                            z_cache,
-                            i,
-                            i + offset,
-                            row_dim,
-                        )
-                    else:
-                        z_cache_offset = i - half_n
-                        z_chunk_b = slice_tensor(
-                            z_cache, z_cache_offset, z_cache_offset + offset, row_dim
-                        )
+    #         return left, right
 
-                b_chunk = compute_projection(
-                    z_chunk_b, mask_chunk, a=False, chunked=False
-                )
-                del z_chunk_b
+    #     z_norm_in = self.layer_norm_in(z)
+    #     a, b = compute_projection(z_norm_in, mask)
+    #     x = self._combine_projections(a, b, _inplace_chunk_size=_inplace_chunk_size)
+    #     x = self.layer_norm_out(x)
+    #     x = self.linear_z(x)
+    #     g = self.linear_g(z_norm_in)
+    #     g.sigmoid_()
+    #     x *= g
+    #     if with_add:
+    #         z += x
+    #     else:
+    #         z = x
 
-                x_chunk = torch.einsum("...ij,...jk->...ik", a, b_chunk)
-                x_chunk = permute_final_dims(x_chunk, (1, 2, 0))
-                x_chunk = self.layer_norm_out(x_chunk)
-                x_chunk = self.linear_z(x_chunk)
-
-                # The g dimension (col_dim) is parallel to and ahead of the
-                # overwrites in z. We can extract the g chunk normally.
-                z_chunk_g = slice_tensor(z, i, i + offset, col_dim)
-                g_chunk = self.linear_g(self.layer_norm_in(z_chunk_g))
-                g_chunk.sigmoid_()
-                del z_chunk_g
-
-                x_chunk *= g_chunk
-
-                # Write the columns into z in-place
-                z_slicer = empty_slicer(z)
-                z_slicer[col_dim] = slice(i, i + offset)
-                if with_add:
-                    z[tuple(z_slicer)] += x_chunk
-                else:
-                    z[tuple(z_slicer)] = x_chunk
-        else:
-            b = compute_projection(z, mask, False, False)
-            x = torch.einsum("...ij,...jk->...ik", a, b)
-            x = self.layer_norm_out(x)
-            x = self.linear_z(x)
-            g = self.linear_g(z)
-            g.sigmoid_()
-            x *= g
-            if with_add:
-                z += x
-            else:
-                z = x
-
-        return z
+    #     return z
 
     def forward(
         self,
@@ -1704,23 +1825,23 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
         x = self._post_projections(x, z_flat, z.shape)
         return x
         # else:
-        #     z = self.layer_norm_in(z)
-        #     a = mask  # (1,s, s, 1)
-        #     a = a * self.sigmoid(self.linear_a_g(z))
-        #     a = a * self.linear_a_p(z)
-        #     b = mask
-        #     b = b * self.sigmoid(self.linear_b_g(z))
-        #     b = b * self.linear_b_p(z)
+        # z = self.layer_norm_in(z)
+        # a = mask  # (1,s, s, 1)
+        # a = a * self.sigmoid(self.linear_a_g(z))
+        # a = a * self.linear_a_p(z)
+        # b = mask
+        # b = b * self.sigmoid(self.linear_b_g(z))
+        # b = b * self.linear_b_p(z)
 
-        #     x = self._combine_projections(a, b)
+        # x = self._combine_projections(a, b)
 
-        #     del a, b
-        #     x = self.layer_norm_out(x)
-        #     x = self.linear_z(x)
-        #     g = self.sigmoid(self.linear_g(z))
-        #     x = x * g
+        # del a, b
+        # x = self.layer_norm_out(x)
+        # x = self.linear_z(x)
+        # g = self.sigmoid(self.linear_g(z))
+        # x = x * g
 
-        #     return x
+        # return x
 
 class TriangleMultiplicationOutgoing(TriangleMultiplicativeUpdate):
     """
