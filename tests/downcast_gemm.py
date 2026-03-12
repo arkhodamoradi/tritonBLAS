@@ -235,11 +235,11 @@ def f32_to_mxfp8e4_rtne_kernel_hw(
     fp8_0 = tl.where((fp8_0 & 0x7F) == 0x7F, fp8_0 - 1, fp8_0)
     fp8_1 = tl.where((fp8_1 & 0x7F) == 0x7F, fp8_1 - 1, fp8_1)
 
-    out_even_ptrs = out_ptr + pid_m * stride_outm + (block_start + pair_offsets * 2) * stride_outk
-    out_odd_ptrs = out_ptr + pid_m * stride_outm + (block_start + pair_offsets * 2 + 1) * stride_outk
-    tl.store(out_even_ptrs, fp8_0, mask=(block_start + pair_offsets * 2) < K)
-    tl.store(out_odd_ptrs, fp8_1, mask=(block_start + pair_offsets * 2 + 1) < K)
+    fp8_interleaved = tl.interleave(fp8_0, fp8_1) 
 
+    # Store the interleaved uint8 values directly
+    out_ptrs = out_ptr + pid_m * stride_outm + (block_start + tl.arange(0, BLOCK_SIZE)) * stride_outk
+    tl.store(out_ptrs, fp8_interleaved, mask=(block_start + tl.arange(0, BLOCK_SIZE)) < K)
 
 @triton.jit
 def f32_to_mxfp8e5_rtne_kernel_hw(
@@ -319,10 +319,11 @@ def f32_to_mxfp8e5_rtne_kernel_hw(
     fp8_1 = tl.where((fp8_1 >= 0x7C) & (fp8_1 < 0x80), 0x7B, fp8_1)
     fp8_1 = tl.where(fp8_1 >= 0xFC, 0xFB, fp8_1)
 
-    out_even_ptrs = out_ptr + pid_m * stride_outm + (block_start + pair_offsets * 2) * stride_outk
-    out_odd_ptrs = out_ptr + pid_m * stride_outm + (block_start + pair_offsets * 2 + 1) * stride_outk
-    tl.store(out_even_ptrs, fp8_0, mask=(block_start + pair_offsets * 2) < K)
-    tl.store(out_odd_ptrs, fp8_1, mask=(block_start + pair_offsets * 2 + 1) < K)
+    fp8_interleaved = tl.interleave(fp8_0, fp8_1) 
+
+    # Store the interleaved uint8 values directly
+    out_ptrs = out_ptr + pid_m * stride_outm + (block_start + tl.arange(0, BLOCK_SIZE)) * stride_outk
+    tl.store(out_ptrs, fp8_interleaved, mask=(block_start + tl.arange(0, BLOCK_SIZE)) < K)
 
 @triton.jit
 def f32_to_mxfp8_kernel_sw(
