@@ -509,21 +509,30 @@ def f32_to_mxfp6e2_rtne_kernel_hw(
 
 @triton.jit
 def f32_to_mxfp6e3_rtne_kernel_hw(
-    x_ptr,           
-    out_ptr,        
-    scale_ptr,      
-    M,              
-    K,              
-    stride_xm,       
-    stride_xk,      
-    stride_outm,     
-    stride_outk,    
-    stride_sm,      
-    stride_sg,      
+    x_ptr,
+    out_ptr,
+    scale_ptr,
+    M,
+    K,
+    stride_xm,
+    stride_xk,
+    stride_outm,
+    stride_outk,
+    stride_sm,
+    stride_sg,
     GROUP_SIZE: tl.constexpr,
+    GROUPS_PER_BLOCK: tl.constexpr,
 ):
     """
-    Dummy: For now just replicating E2M3
+    FP6 E3M2 conversion kernel using v_cvt_scalef32_2xpk16_bf6_f32 hardware instruction.
+    This instruction uses RTNE (Round to Nearest Even) rounding mode.
+    Uses v_mov_b32 to arrange registers into consecutive VGPRs before calling the instruction.
+    
+    The instruction requires:
+    - Output: v[0:5] - 6 consecutive VGPRs (192 bits = 32 FP6 values)
+    - Input1: v[6:21] - 16 consecutive VGPRs (16 float values for first half)
+    - Input2: v[22:37] - 16 consecutive VGPRs (16 float values for second half)
+    - Scale: v38 - 1 VGPR (f32)
     """
     pid_m = tl.program_id(0)
     pid_g = tl.program_id(1)
@@ -541,59 +550,136 @@ def f32_to_mxfp6e3_rtne_kernel_hw(
     # Reshape to [GROUPS_PER_BLOCK, GROUP_SIZE] to compute per-group absmax
     x_grouped = tl.reshape(x, (GROUPS_PER_BLOCK, GROUP_SIZE))
 
-    # FP6 E2M3 offset is 2 (not 8 like FP8)
-    scale_exp = get_exponent(x_grouped, 2)
+    # FP6 E3M2 offset is 4 (different from E2M3 which is 2)
+    scale_exp = get_exponent(x_grouped, 4)
 
     # Store scales for each group
     group_indices = tl.arange(0, GROUPS_PER_BLOCK)
     scale_ptrs = scale_ptr + pid_m * stride_sm + (pid_g * GROUPS_PER_BLOCK + group_indices) * stride_sg
     tl.store(scale_ptrs, scale_exp.to(tl.uint8), mask=(pid_g * GROUPS_PER_BLOCK + group_indices) < (K // GROUP_SIZE))
 
-    # Broadcast scale_exp to match all elements
-    scale_exp_expanded = tl.reshape(scale_exp, (GROUPS_PER_BLOCK, 1))
-    scale_exp_broadcast = tl.broadcast_to(scale_exp_expanded, (GROUPS_PER_BLOCK, GROUP_SIZE))
-    scale_exp_flat = tl.reshape(scale_exp_broadcast, (BLOCK_SIZE,))
-
-    # Compute scale factor: 2^(127 - scale_exp) to multiply (inverse of division)
-    scale_factor = tl.exp2((127 - scale_exp_flat).to(tl.float32))
-
-    # Scale the input values (multiply by inverse scale)
-    x_scaled = x * scale_factor
-
-    # Convert F32 to int32 for bit manipulation
-    f32_int = x_scaled.to(tl.int32, bitcast=True)
-
-    # Extract F32 components: [sign(1)][exponent(8)][mantissa(23)]
-    sign = (f32_int >> 31) & 0x1
-    exponent = (f32_int >> 23) & 0xFF
-    mantissa = f32_int & 0x7FFFFF
-
-    # Convert to FP6 E2M3 format
-    fp6_exponent = tl.where(exponent < 127, 0, exponent - 126)
-    fp6_exponent = tl.minimum(fp6_exponent, 3)  # Max exp for E2M3 is 3
-
-    # Mantissa conversion with subnormal handling
-    # For F32: mantissa has 23 bits, we need top 3 bits for FP6 E2M3
-    # Normal case: take bits 22-20 of mantissa
-    # Subnormal cases depend on F32 exponent:
-    fp6_mantissa = tl.where((exponent == 0) | (exponent < 124), 0,
-                   tl.where(exponent == 124, 1,
-                   tl.where(exponent == 125, 2 | (mantissa >> 22),
-                   tl.where(exponent == 126, 4 | (mantissa >> 21),
-                   mantissa >> 20))))  # Normal case: top 3 bits
-
-    fp6_mantissa = fp6_mantissa & 0x7  # Ensure only 3 bits
-
-    # Handle zero case
-    is_zero = (exponent == 0) & (mantissa == 0)
-    fp6_exponent = tl.where(is_zero, 0, fp6_exponent)
-    fp6_mantissa = tl.where(is_zero, 0, fp6_mantissa)
-
-    # Pack into FP6: [sign(1) | exp(2) | mant(3)]
-    fp6 = (sign << 5) | (fp6_exponent << 3) | fp6_mantissa
+    # For HW instruction, we need to process 32 elements at a time
+    # Load 32 floats as individual scalars for the inline asm
+    a0 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 0)
+    a1 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 1)
+    a2 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 2)
+    a3 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 3)
+    a4 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 4)
+    a5 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 5)
+    a6 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 6)
+    a7 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 7)
+    a8 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 8)
+    a9 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 9)
+    a10 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 10)
+    a11 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 11)
+    a12 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 12)
+    a13 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 13)
+    a14 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 14)
+    a15 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 15)
+    a16 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 16)
+    a17 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 17)
+    a18 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 18)
+    a19 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 19)
+    a20 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 20)
+    a21 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 21)
+    a22 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 22)
+    a23 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 23)
+    a24 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 24)
+    a25 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 25)
+    a26 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 26)
+    a27 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 27)
+    a28 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 28)
+    a29 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 29)
+    a30 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 30)
+    a31 = tl.load(x_ptr + pid_m * stride_xm + block_start * stride_xk + 31)
     
-    out_ptrs = out_ptr + pid_m * stride_outm + (block_start + tl.arange(0, BLOCK_SIZE)) * stride_outk
-    tl.store(out_ptrs, fp6.to(tl.uint8), mask=(block_start + tl.arange(0, BLOCK_SIZE)) < K)
+    # Load scale as scalar
+    scale_scalar = tl.load(scale_ptr + pid_m * stride_sm + pid_g * stride_sg).to(tl.uint32)
+    scale_f32_scalar = (scale_scalar << 23)
+    
+    # Use v_mov_b32 to arrange registers into consecutive VGPRs, call FP6 instruction, move results back
+    # Using v_cvt_scalef32_2xpk16_bf6_f32 which uses RTNE rounding (not stochastic)
+    # This instruction takes two sets of 16 floats and produces 32 FP6 E3M2 values
+    (r0, r1, r2, r3, r4, r5) = tl.inline_asm_elementwise(
+        asm="""
+        // Move first 16 input floats to consecutive registers v40-v55
+        v_mov_b32 v40, $6
+        v_mov_b32 v41, $7
+        v_mov_b32 v42, $8
+        v_mov_b32 v43, $9
+        v_mov_b32 v44, $10
+        v_mov_b32 v45, $11
+        v_mov_b32 v46, $12
+        v_mov_b32 v47, $13
+        v_mov_b32 v48, $14
+        v_mov_b32 v49, $15
+        v_mov_b32 v50, $16
+        v_mov_b32 v51, $17
+        v_mov_b32 v52, $18
+        v_mov_b32 v53, $19
+        v_mov_b32 v54, $20
+        v_mov_b32 v55, $21
+        
+        // Move second 16 input floats to consecutive registers v56-v71
+        v_mov_b32 v56, $22
+        v_mov_b32 v57, $23
+        v_mov_b32 v58, $24
+        v_mov_b32 v59, $25
+        v_mov_b32 v60, $26
+        v_mov_b32 v61, $27
+        v_mov_b32 v62, $28
+        v_mov_b32 v63, $29
+        v_mov_b32 v64, $30
+        v_mov_b32 v65, $31
+        v_mov_b32 v66, $32
+        v_mov_b32 v67, $33
+        v_mov_b32 v68, $34
+        v_mov_b32 v69, $35
+        v_mov_b32 v70, $36
+        v_mov_b32 v71, $37
+        
+        // Call FP6 E3M2 conversion with RTNE rounding (2xpk16 version)
+        // Output: v[34:39], Input1: v[40:55], Input2: v[56:71], Scale: $38
+        v_cvt_scalef32_2xpk16_bf6_f32 v[34:39], v[40:55], v[56:71], $38
+        
+        // Move 6 output i32s back to output registers
+        v_mov_b32 $0, v34
+        v_mov_b32 $1, v35
+        v_mov_b32 $2, v36
+        v_mov_b32 $3, v37
+        v_mov_b32 $4, v38
+        v_mov_b32 $5, v39
+        """,
+        constraints=(
+            "=v,=v,=v,=v,=v,=v,"  # 6 outputs ($0-$5)
+            "v,v,v,v,v,v,v,v,v,v,v,v,v,v,v,v,"  # 16 inputs ($6-$21) - first half
+            "v,v,v,v,v,v,v,v,v,v,v,v,v,v,v,v,"  # 16 more inputs ($22-$37) - second half
+            "v,"  # scale ($38)
+            "~{v34},~{v35},~{v36},~{v37},~{v38},~{v39},"  # clobber output registers
+            "~{v40},~{v41},~{v42},~{v43},~{v44},~{v45},~{v46},~{v47},"  # clobber input staging v40-v47
+            "~{v48},~{v49},~{v50},~{v51},~{v52},~{v53},~{v54},~{v55},"  # clobber input staging v48-v55
+            "~{v56},~{v57},~{v58},~{v59},~{v60},~{v61},~{v62},~{v63},"  # clobber input staging v56-v63
+            "~{v64},~{v65},~{v66},~{v67},~{v68},~{v69},~{v70},~{v71}"   # clobber input staging v64-v71
+        ),
+        args=[
+            a0, a1, a2, a3, a4, a5, a6, a7,
+            a8, a9, a10, a11, a12, a13, a14, a15,
+            a16, a17, a18, a19, a20, a21, a22, a23,
+            a24, a25, a26, a27, a28, a29, a30, a31,
+            scale_f32_scalar
+        ],
+        dtype=(tl.int32, tl.int32, tl.int32, tl.int32, tl.int32, tl.int32),
+        is_pure=False,
+        pack=1,
+    )
+    
+    # Store the 6 packed i32 results (192 bits = 32 FP6 values)
+    tl.store(out_ptr + pid_m * stride_outm + (block_start // 32) * 6 + 0, r0)
+    tl.store(out_ptr + pid_m * stride_outm + (block_start // 32) * 6 + 1, r1)
+    tl.store(out_ptr + pid_m * stride_outm + (block_start // 32) * 6 + 2, r2)
+    tl.store(out_ptr + pid_m * stride_outm + (block_start // 32) * 6 + 3, r3)
+    tl.store(out_ptr + pid_m * stride_outm + (block_start // 32) * 6 + 4, r4)
+    tl.store(out_ptr + pid_m * stride_outm + (block_start // 32) * 6 + 5, r5)
 
 @triton.jit
 def f32_to_mxfp8_kernel_sw(
@@ -792,6 +878,7 @@ def f32_to_mxfp6_triton(x: torch.Tensor, fmt: str = "e2m3", group_size: int = 32
                 out_fp6.stride(0), out_fp6.stride(1),
                 scales.stride(0), scales.stride(1),
                 GROUP_SIZE=group_size,
+                GROUPS_PER_BLOCK=GROUPS_PER_BLOCK,
                 num_warps=num_warps,
             )
         
@@ -960,6 +1047,20 @@ def fp6_packed_to_fp32(packed: torch.Tensor, fmt: str = "e2m3") -> torch.Tensor:
     
     out = torch.empty((M, K), dtype=torch.float32, device=packed.device)
     
+    # Determine bit layout based on format
+    # E2M3: [S][EE][MMM] - 1 sign, 2 exponent, 3 mantissa bits
+    # E3M2: [S][EEE][MM] - 1 sign, 3 exponent, 2 mantissa bits
+    if fmt == "e2m3":
+        exp_bits = 2
+        mant_bits = 3
+        exp_mask = 0x3   # 2 bits
+        mant_mask = 0x7  # 3 bits
+    else:  # e3m2
+        exp_bits = 3
+        mant_bits = 2
+        exp_mask = 0x7   # 3 bits
+        mant_mask = 0x3  # 2 bits
+    
     for g in range(n_groups):
         group_bytes = packed_bytes[:, g, :]  # (M, 24) = 192 bits = 32 FP6 values
         
@@ -978,32 +1079,48 @@ def fp6_packed_to_fp32(packed: torch.Tensor, fmt: str = "e2m3") -> torch.Tensor:
                 shift = j * 6
                 fp6_val = (packed_24bit >> shift) & 0x3F
                 
-                # Extract FP6 components: [S][EE][MMM] for E2M3
+                # Extract FP6 components based on format
                 sign = (fp6_val >> 5) & 0x1
-                fp6_exponent = (fp6_val >> 3) & 0x3
-                fp6_mantissa = fp6_val & 0x7
+                fp6_exponent = (fp6_val >> mant_bits) & exp_mask
+                fp6_mantissa = fp6_val & mant_mask
                 
-                # Convert to FP8 E4M3 (from mxfp.py logic)
-                fp8_exponent = torch.where((fp6_exponent == 0) & (fp6_mantissa == 0), 0,
-                                torch.where((fp6_exponent == 0) & (fp6_mantissa == 1), 4,
-                                torch.where((fp6_exponent == 0) & (fp6_mantissa > 1) & (fp6_mantissa < 4), 5,
-                                torch.where((fp6_exponent == 0) & (fp6_mantissa > 3), 6,
-                                fp6_exponent + 6))))
+                if fmt == "e2m3":
+                    # E2M3: Convert to FP8 E4M3 (from mxfp468_gemm.py logic)
+                    fp8_exponent = torch.where((fp6_exponent == 0) & (fp6_mantissa == 0), 0,
+                                    torch.where((fp6_exponent == 0) & (fp6_mantissa == 1), 4,
+                                    torch.where((fp6_exponent == 0) & (fp6_mantissa > 1) & (fp6_mantissa < 4), 5,
+                                    torch.where((fp6_exponent == 0) & (fp6_mantissa > 3), 6,
+                                    fp6_exponent + 6))))
+                    
+                    fp8_mantissa = torch.where((fp6_exponent == 0) & (fp6_mantissa == 0), 0,
+                                    torch.where((fp6_exponent == 0) & (fp6_mantissa == 1), 0,
+                                    torch.where((fp6_exponent == 0) & (fp6_mantissa > 1) & (fp6_mantissa < 4), (fp6_mantissa & 1) << 2,
+                                    torch.where((fp6_exponent == 0) & (fp6_mantissa > 3), (fp6_mantissa & 3) << 1,
+                                    fp6_mantissa))))
+                    
+                    # Convert FP8 E4M3 to float32 (bias = 7)
+                    val = torch.where(fp8_exponent == 0,
+                        fp8_mantissa.float() / 8.0 * (2.0 ** -6),  # subnormal
+                        (1.0 + fp8_mantissa.float() / 8.0) * torch.pow(2.0, fp8_exponent.float() - 7.0)
+                    )
+                else:
+                    # E3M2: Convert to FP8 E5M2 (similar logic)
+                    fp8_exponent = torch.where((fp6_exponent == 0) & (fp6_mantissa == 0), 0,
+                                    torch.where((fp6_exponent == 0) & (fp6_mantissa == 1), 11,
+                                    torch.where((fp6_exponent == 0) & (fp6_mantissa > 1), 12,
+                                    fp6_exponent + 12)))
+                    
+                    fp8_mantissa = torch.where((fp6_exponent == 0) & (fp6_mantissa == 0), 0,
+                                    torch.where((fp6_exponent == 0) & (fp6_mantissa == 1), 0,
+                                    torch.where((fp6_exponent == 0) & (fp6_mantissa > 1), (fp6_mantissa & 1) << 1,
+                                    fp6_mantissa)))
+                    
+                    # Convert FP8 E5M2 to float32 (bias = 15)
+                    val = torch.where(fp8_exponent == 0,
+                        fp8_mantissa.float() / 4.0 * (2.0 ** -14),  # subnormal
+                        (1.0 + fp8_mantissa.float() / 4.0) * torch.pow(2.0, fp8_exponent.float() - 15.0)
+                    )
                 
-                fp8_mantissa = torch.where((fp6_exponent == 0) & (fp6_mantissa == 0), 0,
-                                torch.where((fp6_exponent == 0) & (fp6_mantissa == 1), 0,
-                                torch.where((fp6_exponent == 0) & (fp6_mantissa > 1) & (fp6_mantissa < 4), (fp6_mantissa & 1) << 2,
-                                torch.where((fp6_exponent == 0) & (fp6_mantissa > 3), (fp6_mantissa & 3) << 1,
-                                fp6_mantissa))))
-                
-                # Pack FP8 and convert to float
-                fp8_packed = (sign << 7) | (fp8_exponent << 3) | fp8_mantissa
-                
-                # Convert FP8 to float32 (E4M3 bias = 7)
-                val = torch.where(fp8_exponent == 0,
-                    fp8_mantissa.float() / 8.0 * (2.0 ** -6),  # subnormal
-                    (1.0 + fp8_mantissa.float() / 8.0) * torch.pow(2.0, fp8_exponent.float() - 7.0)
-                )
                 val = torch.where(sign.bool(), -val, val)
                 
                 out[:, g * 32 + i * 4 + j] = val
@@ -1049,7 +1166,7 @@ def main():
     # Create random F32 tensors (activations and weights)
     A = torch.randn((M, K), device="cuda", dtype=torch.float32)
         
-    fmt = "e2m3"
+    fmt = "e3m2"
     CASTDICT = {"e4m3": tcast.mxfp8e4, "e5m2": tcast.mxfp8e5, "e2m3": tcast.mxfp6e2, "e3m2": tcast.mxfp6e3, "e2m1": tcast.mxfp4e2}
     
     # Helper function for TCAST conversion
