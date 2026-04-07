@@ -419,9 +419,7 @@ def f32_to_mxfp6e2_rtne_kernel_hw(
     # Load scale as scalar
     scale_scalar = tl.load(scale_ptr + pid_m * stride_sm + pid_g * stride_sg).to(tl.uint32)
     scale_f32_scalar = (scale_scalar << 23)
-    
-    sr_seed = 0x12345678
-    
+        
     # Use v_mov_b32 to arrange registers into consecutive VGPRs, call FP6 instruction, move results back
     # Using v_cvt_scalef32_2xpk16_fp6_f32 which uses RTNE rounding (not stochastic)
     # This instruction takes two sets of 16 floats and produces 32 FP6 values
@@ -481,16 +479,16 @@ def f32_to_mxfp6e2_rtne_kernel_hw(
             "v,v,v,v,v,v,v,v,v,v,v,v,v,v,v,v,"  # 16 more inputs ($22-$37) - second half
             "v,"  # scale ($38)
             "~{v34},~{v35},~{v36},~{v37},~{v38},~{v39},"  # clobber output registers
-            "~{v40},~{v41},~{v42},~{v43},~{v44},~{v45},~{v46},~{v47},"  # clobber input staging v40-v47
-            "~{v48},~{v49},~{v50},~{v51},~{v52},~{v53},~{v54},~{v55},"  # clobber input staging v48-v55
-            "~{v56},~{v57},~{v58},~{v59},~{v60},~{v61},~{v62},~{v63},"  # clobber input staging v56-v63
-            "~{v64},~{v65},~{v66},~{v67},~{v68},~{v69},~{v70},~{v71}"   # clobber input staging v64-v71
+            "~{v40},~{v41},~{v42},~{v43},~{v44},~{v45},~{v46},~{v47},"  
+            "~{v48},~{v49},~{v50},~{v51},~{v52},~{v53},~{v54},~{v55}," 
+            "~{v56},~{v57},~{v58},~{v59},~{v60},~{v61},~{v62},~{v63}," 
+            "~{v64},~{v65},~{v66},~{v67},~{v68},~{v69},~{v70},~{v71}" 
         ),
-        args=[
-            a0, a1, a2, a3, a4, a5, a6, a7,
-            a8, a9, a10, a11, a12, a13, a14, a15,
-            a16, a17, a18, a19, a20, a21, a22, a23,
-            a24, a25, a26, a27, a28, a29, a30, a31,
+        args=[ # Interleave the inputs to match the instruction requirements
+            a0, a2, a4, a6, a8, a10, a12, a14,
+            a16, a18, a20, a22, a24, a26, a28, a30,
+            a1, a3, a5, a7, a9, a11, a13, a15,
+            a17, a19, a21, a23, a25, a27, a29, a31,
             scale_f32_scalar
         ],
         dtype=(tl.int32, tl.int32, tl.int32, tl.int32, tl.int32, tl.int32),
@@ -656,16 +654,16 @@ def f32_to_mxfp6e3_rtne_kernel_hw(
             "v,v,v,v,v,v,v,v,v,v,v,v,v,v,v,v,"  # 16 more inputs ($22-$37) - second half
             "v,"  # scale ($38)
             "~{v34},~{v35},~{v36},~{v37},~{v38},~{v39},"  # clobber output registers
-            "~{v40},~{v41},~{v42},~{v43},~{v44},~{v45},~{v46},~{v47},"  # clobber input staging v40-v47
-            "~{v48},~{v49},~{v50},~{v51},~{v52},~{v53},~{v54},~{v55},"  # clobber input staging v48-v55
-            "~{v56},~{v57},~{v58},~{v59},~{v60},~{v61},~{v62},~{v63},"  # clobber input staging v56-v63
-            "~{v64},~{v65},~{v66},~{v67},~{v68},~{v69},~{v70},~{v71}"   # clobber input staging v64-v71
+            "~{v40},~{v41},~{v42},~{v43},~{v44},~{v45},~{v46},~{v47},"  
+            "~{v48},~{v49},~{v50},~{v51},~{v52},~{v53},~{v54},~{v55},"  
+            "~{v56},~{v57},~{v58},~{v59},~{v60},~{v61},~{v62},~{v63}," 
+            "~{v64},~{v65},~{v66},~{v67},~{v68},~{v69},~{v70},~{v71}"  
         ),
-        args=[
-            a0, a1, a2, a3, a4, a5, a6, a7,
-            a8, a9, a10, a11, a12, a13, a14, a15,
-            a16, a17, a18, a19, a20, a21, a22, a23,
-            a24, a25, a26, a27, a28, a29, a30, a31,
+        args=[ # Interleave the inputs to match the instruction requirements
+            a0, a2, a4, a6, a8, a10, a12, a14,
+            a16, a18, a20, a22, a24, a26, a28, a30,
+            a1, a3, a5, a7, a9, a11, a13, a15,
+            a17, a19, a21, a23, a25, a27, a29, a31,
             scale_f32_scalar
         ],
         dtype=(tl.int32, tl.int32, tl.int32, tl.int32, tl.int32, tl.int32),
@@ -1125,14 +1123,6 @@ def fp6_packed_to_fp32(packed: torch.Tensor, fmt: str = "e2m3") -> torch.Tensor:
                 
                 out[:, g * 32 + i * 4 + j] = val
     
-    # De-interleave: HW packs first 16 values at even positions, second 16 at odd positions
-    # TCAST expects: [0:16] = first 16 values, [16:32] = second 16 values
-    # HW produces: [0,2,4,...,30] = first 16 values, [1,3,5,...,31] = second 16 values
-    for g in range(n_groups):
-        temp = out[:, g*32 : g*32+32].clone()
-        out[:, g*32 : g*32+16] = temp[:, 0::2]      # even indices -> first 16
-        out[:, g*32+16 : g*32+32] = temp[:, 1::2]   # odd indices -> second 16
-    
     return out
 
 def fp6_e2m3_to_fp32(packed: torch.Tensor) -> torch.Tensor:
@@ -1140,8 +1130,7 @@ def fp6_e2m3_to_fp32(packed: torch.Tensor) -> torch.Tensor:
     Decode packed FP6 E2M3 (BF6) values into float32.
     Wrapper for fp6_packed_to_fp32 with fmt="e2m3".
     """
-    print("Shape: ")
-    print(packed.shape) # [8192, 1536] = 8192/32-bit = 256 = 1536/6-bit
+    # [8192, 1536] = 8192/32-bit = 256 = 1536/6-bit
     return fp6_packed_to_fp32(packed, fmt="e2m3")
 
 
@@ -1166,7 +1155,7 @@ def main():
     # Create random F32 tensors (activations and weights)
     A = torch.randn((M, K), device="cuda", dtype=torch.float32)
         
-    fmt = "e3m2"
+    fmt = "e2m3"
     CASTDICT = {"e4m3": tcast.mxfp8e4, "e5m2": tcast.mxfp8e5, "e2m3": tcast.mxfp6e2, "e3m2": tcast.mxfp6e3, "e2m1": tcast.mxfp4e2}
     
     # Helper function for TCAST conversion
