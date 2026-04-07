@@ -1008,6 +1008,14 @@ def fp6_packed_to_fp32(packed: torch.Tensor, fmt: str = "e2m3") -> torch.Tensor:
                 
                 out[:, g * 32 + i * 4 + j] = val
     
+    # De-interleave: HW packs first 16 values at even positions, second 16 at odd positions
+    # TCAST expects: [0:16] = first 16 values, [16:32] = second 16 values
+    # HW produces: [0,2,4,...,30] = first 16 values, [1,3,5,...,31] = second 16 values
+    for g in range(n_groups):
+        temp = out[:, g*32 : g*32+32].clone()
+        out[:, g*32 : g*32+16] = temp[:, 0::2]      # even indices -> first 16
+        out[:, g*32+16 : g*32+32] = temp[:, 1::2]   # odd indices -> second 16
+    
     return out
 
 def fp6_e2m3_to_fp32(packed: torch.Tensor) -> torch.Tensor:
