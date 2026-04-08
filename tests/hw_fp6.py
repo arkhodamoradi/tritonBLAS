@@ -922,7 +922,7 @@ def f32_to_mxfp8_triton(x: torch.Tensor, fmt: str = "e4m3", group_size: int = 32
                 num_warps=num_warps,
             )
         else:
-            grid_e5m2 = (M, n_groups)
+            grid_e5m2 = (M, n_groups // GROUPS_PER_BLOCK)
             f32_to_mxfp8e5_rtne_kernel_hw[grid_e5m2](
                 x, out_fp8, scales,
                 M, K,
