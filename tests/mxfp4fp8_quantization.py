@@ -56,20 +56,30 @@ def _get_exponent(x, offset):
 
 
 @triton.jit
-def _get_exponent_midmax(x, offset, y: tl.constexpr):
-    """Return E8M0 exponent for each row of x [GROUPS, GROUP_SIZE], with a
-    midmax bias applied to absmax_bits before exponent extraction.
+def _get_exponent_midmax(x, offset, midmax: tl.constexpr):
+    """Return E8M0 exponent for each row of x [GROUPS, GROUP_SIZE].
 
-    The bias ``(22 - y) << 1`` is added to the int32 bit-pattern of absmax,
-    where ``y`` is the number of mantissa bits in the target format:
-      * E4M3 → y=3   bias=38
-      * E5M2 → y=2   bias=40
-      * E2M1 → y=1   bias=42
+    Hard-coded midmax values per format:
+      * E4M3fn → midmax = 464.0
+      * E5M2   → midmax = 61440.0
+      * E2M1   → midmax = 7.0
+
+    absmax is normalised into [2^offset, 2^(offset+1)) by replacing its FP32
+    exponent field with (127 + offset).  If this normalised value exceeds
+    midmax the E8M0 scale exponent is incremented by 1.
     """
     absmax = tl.max(tl.abs(x), axis=1)
-    absmax_bits = absmax.to(tl.int32, bitcast=True) + ((22 - y) << 1)
+    absmax_bits = absmax.to(tl.int32, bitcast=True)
     f32_exp = (absmax_bits >> 23) & 0xFF
     exp = f32_exp - offset
+
+    # Replace FP32 exponent with (127 + offset) to normalise absmax into
+    # [2^offset, 2^(offset+1)) regardless of the original exponent.
+    amax_scaled_bits = (absmax_bits & 0x7FFFFF) | ((127 + offset) << 23)
+    amax_scaled = amax_scaled_bits.to(tl.float32, bitcast=True)
+
+    # If amax_scaled > midmax the current scale is insufficient: bump exp.
+    exp = exp + (amax_scaled > midmax).to(tl.int32)
     exp = tl.maximum(exp, 0)
     exp = tl.minimum(exp, 255)
     return exp
@@ -89,7 +99,7 @@ def _f32_to_mxfp8e4_rtne_kernel(
     GROUP_SIZE: tl.constexpr,
     GROUPS_PER_BLOCK: tl.constexpr,
     MIDMAX: tl.constexpr = False,
-    MANTISSA_BITS: tl.constexpr = 3,
+    MIDMAX_VAL: tl.constexpr = 464.0,
 ):
     """
     Convert FP32 → MXFP8 E4M3 with RTNE using v_cvt_scalef32_pk_fp8_f32.
@@ -107,7 +117,7 @@ def _f32_to_mxfp8e4_rtne_kernel(
                  mask=offsets < K, other=0.0)
 
     x_grouped = tl.reshape(x, (GROUPS_PER_BLOCK, GROUP_SIZE))
-    scale_exp = _get_exponent_midmax(x_grouped, 8, MANTISSA_BITS) if MIDMAX else _get_exponent(x_grouped, 8)
+    scale_exp = _get_exponent_midmax(x_grouped, 8, MIDMAX_VAL) if MIDMAX else _get_exponent(x_grouped, 8)
 
     group_indices = tl.arange(0, GROUPS_PER_BLOCK)
     g_abs = pid_g * GROUPS_PER_BLOCK + group_indices
@@ -158,7 +168,8 @@ def _f32_to_mxfp8e4_sr_kernel(
     GROUP_SIZE: tl.constexpr,
     GROUPS_PER_BLOCK: tl.constexpr,
     MIDMAX: tl.constexpr = False,
-    MANTISSA_BITS: tl.constexpr = 3,
+    MIDMAX_VAL: tl.constexpr = 464.0,
+    SR_SEED: tl.constexpr = 0.5,
 ):
     """
     Convert FP32 → MXFP8 E4M3 with stochastic rounding via
@@ -176,7 +187,7 @@ def _f32_to_mxfp8e4_sr_kernel(
                  mask=offsets < K, other=0.0)
 
     x_grouped = tl.reshape(x, (GROUPS_PER_BLOCK, GROUP_SIZE))
-    scale_exp = _get_exponent_midmax(x_grouped, 8, MANTISSA_BITS) if MIDMAX else _get_exponent(x_grouped, 8)
+    scale_exp = _get_exponent_midmax(x_grouped, 8, MIDMAX_VAL) if MIDMAX else _get_exponent(x_grouped, 8)
 
     group_indices = tl.arange(0, GROUPS_PER_BLOCK)
     g_abs = pid_g * GROUPS_PER_BLOCK + group_indices
@@ -190,11 +201,10 @@ def _f32_to_mxfp8e4_sr_kernel(
     )
     scale_f32 = (tl.reshape(scale_exp_broad, (BLOCK_SIZE,)).to(tl.uint32) << 23)
 
-    sr_seed = 0.0
     fp8 = tl.inline_asm_elementwise(
         "v_cvt_scalef32_sr_fp8_f32 $0, $1, $2, $3",
         "=v,v,v,v",
-        args=[x, sr_seed, scale_f32],
+        args=[x, SR_SEED, scale_f32],
         dtype=tl.uint16, is_pure=True, pack=1,
     )
     fp8 = fp8.to(tl.uint8)
@@ -218,7 +228,7 @@ def _f32_to_mxfp8e5_rtne_kernel(
     GROUP_SIZE: tl.constexpr,
     GROUPS_PER_BLOCK: tl.constexpr,
     MIDMAX: tl.constexpr = False,
-    MANTISSA_BITS: tl.constexpr = 2,
+    MIDMAX_VAL: tl.constexpr = 61440.0,
 ):
     pid_m = tl.program_id(0)
     pid_g = tl.program_id(1)
@@ -232,7 +242,7 @@ def _f32_to_mxfp8e5_rtne_kernel(
                  mask=offsets < K, other=0.0)
 
     x_grouped = tl.reshape(x, (GROUPS_PER_BLOCK, GROUP_SIZE))
-    scale_exp = _get_exponent_midmax(x_grouped, 15, MANTISSA_BITS) if MIDMAX else _get_exponent(x_grouped, 15)
+    scale_exp = _get_exponent_midmax(x_grouped, 15, MIDMAX_VAL) if MIDMAX else _get_exponent(x_grouped, 15)
 
     group_indices = tl.arange(0, GROUPS_PER_BLOCK)
     g_abs = pid_g * GROUPS_PER_BLOCK + group_indices
@@ -284,7 +294,8 @@ def _f32_to_mxfp8e5_sr_kernel(
     GROUP_SIZE: tl.constexpr,
     GROUPS_PER_BLOCK: tl.constexpr,
     MIDMAX: tl.constexpr = False,
-    MANTISSA_BITS: tl.constexpr = 2,
+    MIDMAX_VAL: tl.constexpr = 61440.0,
+    SR_SEED: tl.constexpr = 0.5,
 ):
     pid_m = tl.program_id(0)
     pid_g = tl.program_id(1)
@@ -298,7 +309,7 @@ def _f32_to_mxfp8e5_sr_kernel(
                  mask=offsets < K, other=0.0)
 
     x_grouped = tl.reshape(x, (GROUPS_PER_BLOCK, GROUP_SIZE))
-    scale_exp = _get_exponent_midmax(x_grouped, 15, MANTISSA_BITS) if MIDMAX else _get_exponent(x_grouped, 15)
+    scale_exp = _get_exponent_midmax(x_grouped, 15, MIDMAX_VAL) if MIDMAX else _get_exponent(x_grouped, 15)
 
     group_indices = tl.arange(0, GROUPS_PER_BLOCK)
     g_abs = pid_g * GROUPS_PER_BLOCK + group_indices
@@ -312,11 +323,10 @@ def _f32_to_mxfp8e5_sr_kernel(
     )
     scale_f32 = (tl.reshape(scale_exp_broad, (BLOCK_SIZE,)).to(tl.uint32) << 23)
 
-    sr_seed = 0.0
     fp8 = tl.inline_asm_elementwise(
         "v_cvt_scalef32_sr_bf8_f32 $0, $1, $2, $3",
         "=v,v,v,v",
-        args=[x, sr_seed, scale_f32],
+        args=[x, SR_SEED, scale_f32],
         dtype=tl.uint16, is_pure=True, pack=1,
     )
     fp8 = fp8.to(tl.uint8)
@@ -342,7 +352,7 @@ def _f32_to_mxfp4_rtne_kernel(
     GROUP_SIZE: tl.constexpr,
     GROUPS_PER_BLOCK: tl.constexpr,
     MIDMAX: tl.constexpr = False,
-    MANTISSA_BITS: tl.constexpr = 1,
+    MIDMAX_VAL: tl.constexpr = 7.0,
 ):
     """
     Convert FP32 → MXFP4 E2M1 with RTNE using v_cvt_scalef32_pk_fp4_f32.
@@ -360,7 +370,7 @@ def _f32_to_mxfp4_rtne_kernel(
                  mask=offsets < K, other=0.0)
 
     x_grouped = tl.reshape(x, (GROUPS_PER_BLOCK, GROUP_SIZE))
-    scale_exp = _get_exponent_midmax(x_grouped, 2, MANTISSA_BITS) if MIDMAX else _get_exponent(x_grouped, 2)
+    scale_exp = _get_exponent_midmax(x_grouped, 2, MIDMAX_VAL) if MIDMAX else _get_exponent(x_grouped, 2)
 
     group_indices = tl.arange(0, GROUPS_PER_BLOCK)
     g_abs = pid_g * GROUPS_PER_BLOCK + group_indices
@@ -443,6 +453,7 @@ def quantize_mxfp8e4_sr(
     groups_per_block: int = 256,
     num_warps: int = 4,
     midmax: bool = False,
+    sr_seed: float = 0.5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     FP32 → MXFP8 E4M3 (stochastic rounding).
@@ -466,6 +477,7 @@ def quantize_mxfp8e4_sr(
         GROUP_SIZE=group_size,
         GROUPS_PER_BLOCK=groups_per_block,
         MIDMAX=midmax,
+        SR_SEED=sr_seed,
         num_warps=num_warps,
     )
     return out.view(torch.float8_e4m3fn), scales
@@ -511,6 +523,7 @@ def quantize_mxfp8e5_sr(
     groups_per_block: int = 256,
     num_warps: int = 4,
     midmax: bool = False,
+    sr_seed: float = 0.5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     FP32 → MXFP8 E5M2 (stochastic rounding).
@@ -534,6 +547,7 @@ def quantize_mxfp8e5_sr(
         GROUP_SIZE=group_size,
         GROUPS_PER_BLOCK=groups_per_block,
         MIDMAX=midmax,
+        SR_SEED=sr_seed,
         num_warps=num_warps,
     )
     return out.view(torch.float8_e5m2), scales
