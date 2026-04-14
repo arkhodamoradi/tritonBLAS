@@ -642,9 +642,9 @@ def _run_tests():
     except ImportError:
         _tcast_available = False
 
-    def _tcast_quantize(x, fmt, scalemode="max"):
+    def _tcast_quantize(x, fmt, scalemode="max", roundmode="even"):
         """Return (quantized_fp32_values, scales_uint8) from tcast, matching our layout."""
-        tc = tcast.cast(x, _TCAST_DICT[fmt], scalemode=scalemode)
+        tc = tcast.cast(x, _TCAST_DICT[fmt], scalemode=scalemode, roundmode=roundmode)
         tc_scale = tc.scaledata.scale.to(torch.uint8).T.reshape(x.shape[0], -1)
         tc_s = 2.0 ** ((tc.scaledata.scale - 127).float()).T  # [M, n_groups]
         tc_s_broad = tc_s.reshape(x.shape[0], -1).repeat_interleave(32, dim=1)
@@ -673,19 +673,19 @@ def _run_tests():
 
     # (label, fn, kwargs, tcast_fmt, tcast_scalemode)
     configs = [
-        ("MXFP8 E4M3  RTNE       ", quantize_mxfp8e4_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16),               "e4m3", "max"),
-        ("MXFP8 E4M3  RTNE midmax", quantize_mxfp8e4_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16,  midmax=True),  "e4m3", "midmax"),
-        ("MXFP8 E4M3  SR         ", quantize_mxfp8e4_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256),               "e4m3", "max"),
-        ("MXFP8 E4M3  SR  midmax ", quantize_mxfp8e4_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256, midmax=True),  "e4m3", "midmax"),
-        ("MXFP8 E5M2  RTNE       ", quantize_mxfp8e5_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16),               "e5m2", "max"),
-        ("MXFP8 E5M2  RTNE midmax", quantize_mxfp8e5_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16,  midmax=True),  "e5m2", "midmax"),
-        ("MXFP8 E5M2  SR         ", quantize_mxfp8e5_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256),               "e5m2", "max"),
-        ("MXFP8 E5M2  SR  midmax ", quantize_mxfp8e5_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256, midmax=True),  "e5m2", "midmax"),
-        ("MXFP4 E2M1  RTNE       ", quantize_mxfp4_rtne,   dict(group_size=GROUP_SIZE, groups_per_block=16),               "e2m1", "max"),
-        ("MXFP4 E2M1  RTNE midmax", quantize_mxfp4_rtne,   dict(group_size=GROUP_SIZE, groups_per_block=16,  midmax=True),  "e2m1", "midmax"),
+        ("MXFP8 E4M3  RTNE       ", quantize_mxfp8e4_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16),               "e4m3", "max", "even"),
+        ("MXFP8 E4M3  RTNE midmax", quantize_mxfp8e4_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16,  midmax=True),  "e4m3", "midmax", "even"),
+        ("MXFP8 E4M3  SR         ", quantize_mxfp8e4_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256),               "e4m3", "max", "stochastic"),
+        ("MXFP8 E4M3  SR  midmax ", quantize_mxfp8e4_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256, midmax=True),  "e4m3", "midmax", "stochastic"),
+        ("MXFP8 E5M2  RTNE       ", quantize_mxfp8e5_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16),               "e5m2", "max", "even"),
+        ("MXFP8 E5M2  RTNE midmax", quantize_mxfp8e5_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16,  midmax=True),  "e5m2", "midmax", "even"),
+        ("MXFP8 E5M2  SR         ", quantize_mxfp8e5_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256),               "e5m2", "max", "stochastic"),
+        ("MXFP8 E5M2  SR  midmax ", quantize_mxfp8e5_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256, midmax=True),  "e5m2", "midmax", "stochastic"),
+        ("MXFP4 E2M1  RTNE       ", quantize_mxfp4_rtne,   dict(group_size=GROUP_SIZE, groups_per_block=16),               "e2m1", "max", "even"),
+        ("MXFP4 E2M1  RTNE midmax", quantize_mxfp4_rtne,   dict(group_size=GROUP_SIZE, groups_per_block=16,  midmax=True),  "e2m1", "midmax", "even"),
     ]
 
-    for name, fn, kwargs, tc_fmt, tc_scalemode in configs:
+    for name, fn, kwargs, tc_fmt, tc_scalemode, tc_roundmode in configs:
         try:
             q, s = fn(x, **kwargs)
             assert s.shape == (M, K // GROUP_SIZE), f"scale shape mismatch: {s.shape}"
@@ -712,7 +712,7 @@ def _run_tests():
             # Optional: L_inf vs tcast reference
             tc_suffix = ""
             if _tcast_available:
-                tc_q, tc_scale, tc_s_broad = _tcast_quantize(x, tc_fmt, scalemode=tc_scalemode)
+                tc_q, tc_scale, tc_s_broad = _tcast_quantize(x, tc_fmt, scalemode=tc_scalemode, roundmode=tc_roundmode)
                 # compare scales
                 l_inf_scale = torch.max(torch.abs(s.float() - tc_scale.float())).item()
                 # compare dequantized values
