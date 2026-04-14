@@ -55,6 +55,26 @@ def _get_exponent(x, offset):
     return exp
 
 
+@triton.jit
+def _get_exponent_midmax(x, offset, y: tl.constexpr):
+    """Return E8M0 exponent for each row of x [GROUPS, GROUP_SIZE], with a
+    midmax bias applied to absmax_bits before exponent extraction.
+
+    The bias ``(22 - y) << 1`` is added to the int32 bit-pattern of absmax,
+    where ``y`` is the number of mantissa bits in the target format:
+      * E4M3 → y=3   bias=38
+      * E5M2 → y=2   bias=40
+      * E2M1 → y=1   bias=42
+    """
+    absmax = tl.max(tl.abs(x), axis=1)
+    absmax_bits = absmax.to(tl.int32, bitcast=True) + ((22 - y) << 1)
+    f32_exp = (absmax_bits >> 23) & 0xFF
+    exp = f32_exp - offset
+    exp = tl.maximum(exp, 0)
+    exp = tl.minimum(exp, 255)
+    return exp
+
+
 # ---------------------------------------------------------------------------
 # MXFP8 E4M3 – RTNE (round-to-nearest-even) via hardware packed instruction
 # ---------------------------------------------------------------------------
@@ -68,6 +88,8 @@ def _f32_to_mxfp8e4_rtne_kernel(
     stride_sm, stride_sg,
     GROUP_SIZE: tl.constexpr,
     GROUPS_PER_BLOCK: tl.constexpr,
+    MIDMAX: tl.constexpr = False,
+    MANTISSA_BITS: tl.constexpr = 3,
 ):
     """
     Convert FP32 → MXFP8 E4M3 with RTNE using v_cvt_scalef32_pk_fp8_f32.
@@ -85,7 +107,7 @@ def _f32_to_mxfp8e4_rtne_kernel(
                  mask=offsets < K, other=0.0)
 
     x_grouped = tl.reshape(x, (GROUPS_PER_BLOCK, GROUP_SIZE))
-    scale_exp = _get_exponent(x_grouped, 8)
+    scale_exp = _get_exponent_midmax(x_grouped, 8, MANTISSA_BITS) if MIDMAX else _get_exponent(x_grouped, 8)
 
     group_indices = tl.arange(0, GROUPS_PER_BLOCK)
     g_abs = pid_g * GROUPS_PER_BLOCK + group_indices
@@ -135,6 +157,8 @@ def _f32_to_mxfp8e4_sr_kernel(
     stride_sm, stride_sg,
     GROUP_SIZE: tl.constexpr,
     GROUPS_PER_BLOCK: tl.constexpr,
+    MIDMAX: tl.constexpr = False,
+    MANTISSA_BITS: tl.constexpr = 3,
 ):
     """
     Convert FP32 → MXFP8 E4M3 with stochastic rounding via
@@ -152,7 +176,7 @@ def _f32_to_mxfp8e4_sr_kernel(
                  mask=offsets < K, other=0.0)
 
     x_grouped = tl.reshape(x, (GROUPS_PER_BLOCK, GROUP_SIZE))
-    scale_exp = _get_exponent(x_grouped, 8)
+    scale_exp = _get_exponent_midmax(x_grouped, 8, MANTISSA_BITS) if MIDMAX else _get_exponent(x_grouped, 8)
 
     group_indices = tl.arange(0, GROUPS_PER_BLOCK)
     g_abs = pid_g * GROUPS_PER_BLOCK + group_indices
@@ -193,6 +217,8 @@ def _f32_to_mxfp8e5_rtne_kernel(
     stride_sm, stride_sg,
     GROUP_SIZE: tl.constexpr,
     GROUPS_PER_BLOCK: tl.constexpr,
+    MIDMAX: tl.constexpr = False,
+    MANTISSA_BITS: tl.constexpr = 2,
 ):
     pid_m = tl.program_id(0)
     pid_g = tl.program_id(1)
@@ -206,7 +232,7 @@ def _f32_to_mxfp8e5_rtne_kernel(
                  mask=offsets < K, other=0.0)
 
     x_grouped = tl.reshape(x, (GROUPS_PER_BLOCK, GROUP_SIZE))
-    scale_exp = _get_exponent(x_grouped, 15)
+    scale_exp = _get_exponent_midmax(x_grouped, 15, MANTISSA_BITS) if MIDMAX else _get_exponent(x_grouped, 15)
 
     group_indices = tl.arange(0, GROUPS_PER_BLOCK)
     g_abs = pid_g * GROUPS_PER_BLOCK + group_indices
@@ -257,6 +283,8 @@ def _f32_to_mxfp8e5_sr_kernel(
     stride_sm, stride_sg,
     GROUP_SIZE: tl.constexpr,
     GROUPS_PER_BLOCK: tl.constexpr,
+    MIDMAX: tl.constexpr = False,
+    MANTISSA_BITS: tl.constexpr = 2,
 ):
     pid_m = tl.program_id(0)
     pid_g = tl.program_id(1)
@@ -270,7 +298,7 @@ def _f32_to_mxfp8e5_sr_kernel(
                  mask=offsets < K, other=0.0)
 
     x_grouped = tl.reshape(x, (GROUPS_PER_BLOCK, GROUP_SIZE))
-    scale_exp = _get_exponent(x_grouped, 15)
+    scale_exp = _get_exponent_midmax(x_grouped, 15, MANTISSA_BITS) if MIDMAX else _get_exponent(x_grouped, 15)
 
     group_indices = tl.arange(0, GROUPS_PER_BLOCK)
     g_abs = pid_g * GROUPS_PER_BLOCK + group_indices
@@ -313,6 +341,8 @@ def _f32_to_mxfp4_rtne_kernel(
     stride_sm, stride_sg,
     GROUP_SIZE: tl.constexpr,
     GROUPS_PER_BLOCK: tl.constexpr,
+    MIDMAX: tl.constexpr = False,
+    MANTISSA_BITS: tl.constexpr = 1,
 ):
     """
     Convert FP32 → MXFP4 E2M1 with RTNE using v_cvt_scalef32_pk_fp4_f32.
@@ -330,7 +360,7 @@ def _f32_to_mxfp4_rtne_kernel(
                  mask=offsets < K, other=0.0)
 
     x_grouped = tl.reshape(x, (GROUPS_PER_BLOCK, GROUP_SIZE))
-    scale_exp = _get_exponent(x_grouped, 2)
+    scale_exp = _get_exponent_midmax(x_grouped, 2, MANTISSA_BITS) if MIDMAX else _get_exponent(x_grouped, 2)
 
     group_indices = tl.arange(0, GROUPS_PER_BLOCK)
     g_abs = pid_g * GROUPS_PER_BLOCK + group_indices
@@ -378,6 +408,7 @@ def quantize_mxfp8e4_rtne(
     group_size: int = 32,
     groups_per_block: int = 16,
     num_warps: int = 4,
+    midmax: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     FP32 → MXFP8 E4M3 (round-to-nearest-even).
@@ -400,6 +431,7 @@ def quantize_mxfp8e4_rtne(
         scales.stride(0), scales.stride(1),
         GROUP_SIZE=group_size,
         GROUPS_PER_BLOCK=groups_per_block,
+        MIDMAX=midmax,
         num_warps=num_warps,
     )
     return out.view(torch.float8_e4m3fn), scales
@@ -410,6 +442,7 @@ def quantize_mxfp8e4_sr(
     group_size: int = 32,
     groups_per_block: int = 256,
     num_warps: int = 4,
+    midmax: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     FP32 → MXFP8 E4M3 (stochastic rounding).
@@ -432,6 +465,7 @@ def quantize_mxfp8e4_sr(
         scales.stride(0), scales.stride(1),
         GROUP_SIZE=group_size,
         GROUPS_PER_BLOCK=groups_per_block,
+        MIDMAX=midmax,
         num_warps=num_warps,
     )
     return out.view(torch.float8_e4m3fn), scales
@@ -442,6 +476,7 @@ def quantize_mxfp8e5_rtne(
     group_size: int = 32,
     groups_per_block: int = 16,
     num_warps: int = 4,
+    midmax: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     FP32 → MXFP8 E5M2 (round-to-nearest-even).
@@ -464,6 +499,7 @@ def quantize_mxfp8e5_rtne(
         scales.stride(0), scales.stride(1),
         GROUP_SIZE=group_size,
         GROUPS_PER_BLOCK=groups_per_block,
+        MIDMAX=midmax,
         num_warps=num_warps,
     )
     return out.view(torch.float8_e5m2), scales
@@ -474,6 +510,7 @@ def quantize_mxfp8e5_sr(
     group_size: int = 32,
     groups_per_block: int = 256,
     num_warps: int = 4,
+    midmax: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     FP32 → MXFP8 E5M2 (stochastic rounding).
@@ -496,6 +533,7 @@ def quantize_mxfp8e5_sr(
         scales.stride(0), scales.stride(1),
         GROUP_SIZE=group_size,
         GROUPS_PER_BLOCK=groups_per_block,
+        MIDMAX=midmax,
         num_warps=num_warps,
     )
     return out.view(torch.float8_e5m2), scales
@@ -506,6 +544,7 @@ def quantize_mxfp4_rtne(
     group_size: int = 32,
     groups_per_block: int = 16,
     num_warps: int = 4,
+    midmax: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     FP32 → MXFP4 E2M1 (round-to-nearest-even).
@@ -528,6 +567,7 @@ def quantize_mxfp4_rtne(
         scales.stride(0), scales.stride(1),
         GROUP_SIZE=group_size,
         GROUPS_PER_BLOCK=groups_per_block,
+        MIDMAX=midmax,
         num_warps=num_warps,
     )
     return out, scales
@@ -588,9 +628,9 @@ def _run_tests():
     except ImportError:
         _tcast_available = False
 
-    def _tcast_quantize(x, fmt):
+    def _tcast_quantize(x, fmt, scalemode="absmax"):
         """Return (quantized_fp32_values, scales_uint8) from tcast, matching our layout."""
-        tc = tcast.cast(x, _TCAST_DICT[fmt])
+        tc = tcast.cast(x, _TCAST_DICT[fmt], scalemode=scalemode)
         tc_scale = tc.scaledata.scale.to(torch.uint8).T.reshape(x.shape[0], -1)
         tc_s = 2.0 ** ((tc.scaledata.scale - 127).float()).T  # [M, n_groups]
         tc_s_broad = tc_s.reshape(x.shape[0], -1).repeat_interleave(32, dim=1)
@@ -617,16 +657,21 @@ def _run_tests():
 
     x = torch.randn((M, K), device="cuda", dtype=torch.float32)
 
-    # (label, fn, kwargs, tcast_fmt)
+    # (label, fn, kwargs, tcast_fmt, tcast_scalemode)
     configs = [
-        ("MXFP8 E4M3  RTNE", quantize_mxfp8e4_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16),  "e4m3"),
-        ("MXFP8 E4M3  SR  ", quantize_mxfp8e4_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256), "e4m3"),
-        ("MXFP8 E5M2  RTNE", quantize_mxfp8e5_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16),  "e5m2"),
-        ("MXFP8 E5M2  SR  ", quantize_mxfp8e5_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256), "e5m2"),
-        ("MXFP4 E2M1  RTNE", quantize_mxfp4_rtne,   dict(group_size=GROUP_SIZE, groups_per_block=16),  "e2m1"),
+        ("MXFP8 E4M3  RTNE       ", quantize_mxfp8e4_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16),               "e4m3", "absmax"),
+        ("MXFP8 E4M3  RTNE midmax", quantize_mxfp8e4_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16,  midmax=True),  "e4m3", "midmax"),
+        ("MXFP8 E4M3  SR         ", quantize_mxfp8e4_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256),               "e4m3", "absmax"),
+        ("MXFP8 E4M3  SR  midmax ", quantize_mxfp8e4_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256, midmax=True),  "e4m3", "midmax"),
+        ("MXFP8 E5M2  RTNE       ", quantize_mxfp8e5_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16),               "e5m2", "absmax"),
+        ("MXFP8 E5M2  RTNE midmax", quantize_mxfp8e5_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16,  midmax=True),  "e5m2", "midmax"),
+        ("MXFP8 E5M2  SR         ", quantize_mxfp8e5_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256),               "e5m2", "absmax"),
+        ("MXFP8 E5M2  SR  midmax ", quantize_mxfp8e5_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256, midmax=True),  "e5m2", "midmax"),
+        ("MXFP4 E2M1  RTNE       ", quantize_mxfp4_rtne,   dict(group_size=GROUP_SIZE, groups_per_block=16),               "e2m1", "absmax"),
+        ("MXFP4 E2M1  RTNE midmax", quantize_mxfp4_rtne,   dict(group_size=GROUP_SIZE, groups_per_block=16,  midmax=True),  "e2m1", "midmax"),
     ]
 
-    for name, fn, kwargs, tc_fmt in configs:
+    for name, fn, kwargs, tc_fmt, tc_scalemode in configs:
         try:
             q, s = fn(x, **kwargs)
             assert s.shape == (M, K // GROUP_SIZE), f"scale shape mismatch: {s.shape}"
@@ -653,7 +698,7 @@ def _run_tests():
             # Optional: L_inf vs tcast reference
             tc_suffix = ""
             if _tcast_available:
-                tc_q, tc_scale, tc_s_broad = _tcast_quantize(x, tc_fmt)
+                tc_q, tc_scale, tc_s_broad = _tcast_quantize(x, tc_fmt, scalemode=tc_scalemode)
                 # compare scales
                 l_inf_scale = torch.max(torch.abs(s.float() - tc_scale.float())).item()
                 # compare dequantized values
