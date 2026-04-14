@@ -628,7 +628,7 @@ def _run_tests():
     except ImportError:
         _tcast_available = False
 
-    def _tcast_quantize(x, fmt, scalemode="absmax"):
+    def _tcast_quantize(x, fmt, scalemode="max"):
         """Return (quantized_fp32_values, scales_uint8) from tcast, matching our layout."""
         tc = tcast.cast(x, _TCAST_DICT[fmt], scalemode=scalemode)
         tc_scale = tc.scaledata.scale.to(torch.uint8).T.reshape(x.shape[0], -1)
@@ -659,15 +659,15 @@ def _run_tests():
 
     # (label, fn, kwargs, tcast_fmt, tcast_scalemode)
     configs = [
-        ("MXFP8 E4M3  RTNE       ", quantize_mxfp8e4_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16),               "e4m3", "absmax"),
+        ("MXFP8 E4M3  RTNE       ", quantize_mxfp8e4_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16),               "e4m3", "max"),
         ("MXFP8 E4M3  RTNE midmax", quantize_mxfp8e4_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16,  midmax=True),  "e4m3", "midmax"),
-        ("MXFP8 E4M3  SR         ", quantize_mxfp8e4_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256),               "e4m3", "absmax"),
+        ("MXFP8 E4M3  SR         ", quantize_mxfp8e4_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256),               "e4m3", "max"),
         ("MXFP8 E4M3  SR  midmax ", quantize_mxfp8e4_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256, midmax=True),  "e4m3", "midmax"),
-        ("MXFP8 E5M2  RTNE       ", quantize_mxfp8e5_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16),               "e5m2", "absmax"),
+        ("MXFP8 E5M2  RTNE       ", quantize_mxfp8e5_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16),               "e5m2", "max"),
         ("MXFP8 E5M2  RTNE midmax", quantize_mxfp8e5_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16,  midmax=True),  "e5m2", "midmax"),
-        ("MXFP8 E5M2  SR         ", quantize_mxfp8e5_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256),               "e5m2", "absmax"),
+        ("MXFP8 E5M2  SR         ", quantize_mxfp8e5_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256),               "e5m2", "max"),
         ("MXFP8 E5M2  SR  midmax ", quantize_mxfp8e5_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256, midmax=True),  "e5m2", "midmax"),
-        ("MXFP4 E2M1  RTNE       ", quantize_mxfp4_rtne,   dict(group_size=GROUP_SIZE, groups_per_block=16),               "e2m1", "absmax"),
+        ("MXFP4 E2M1  RTNE       ", quantize_mxfp4_rtne,   dict(group_size=GROUP_SIZE, groups_per_block=16),               "e2m1", "max"),
         ("MXFP4 E2M1  RTNE midmax", quantize_mxfp4_rtne,   dict(group_size=GROUP_SIZE, groups_per_block=16,  midmax=True),  "e2m1", "midmax"),
     ]
 
