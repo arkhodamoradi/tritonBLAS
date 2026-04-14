@@ -272,7 +272,7 @@ def _run_tests():
                 try:
                     C_tc = _tcast_gemm(A, B, *tc_fmts)
                     l_inf_vs_tc = torch.max(torch.abs(C - C_tc)).item()
-                    tc_suffix = f"  vs_tcast={l_inf_vs_tc:.3f}"
+                    tc_suffix = f"  vs_tcast L_inf={l_inf_vs_tc:.3f}"
                 except Exception as tc_e:
                     tc_suffix = f"  vs_tcast=ERR({tc_e})"
 

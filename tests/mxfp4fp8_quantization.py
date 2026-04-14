@@ -665,7 +665,7 @@ def _run_tests():
                 else:
                     tc_recon = tc_q.float() * tc_s_broad
                     l_inf_vs_tc = torch.max(torch.abs(x_recon - tc_recon)).item()
-                tc_suffix = f"  vs_tcast(scale={l_inf_scale:.1f}, val={l_inf_vs_tc:.4f})"
+                tc_suffix = f"  vs_tcast(L_inf scale={l_inf_scale:.1f}, L_inf val={l_inf_vs_tc:.4f})"
 
             ms = tt.do_bench(lambda: fn(x, **kwargs), warmup=25, rep=500)
             gbps = x.numel() * 4 / (ms * 1e-3) / 1e9
