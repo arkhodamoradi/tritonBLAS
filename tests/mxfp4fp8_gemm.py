@@ -28,11 +28,11 @@ from mxfp468_gemm import mxfp468_dot_scaled_gemm   # Triton JIT kernel
 
 # Quantization wrappers from the companion module
 from mxfp4fp8_quantization import (
-    quantize_mxfp8e4_rtn,
+    quantize_mxfp8e4_rtne,
     quantize_mxfp8e4_sr,
-    quantize_mxfp8e5_rtn,
+    quantize_mxfp8e5_rtne,
     quantize_mxfp8e5_sr,
-    quantize_mxfp4_rtn,
+    quantize_mxfp4_rtne,
     fp4_e2m1_to_fp32,
 )
 
@@ -161,41 +161,41 @@ def _e2e_gemm(A_f32, B_f32, afmt, bfmt, quant_A, quant_B,
     )
 
 
-def gemm_fp32_e4m3_e4m3(A, B, rounding="rtn", **kw):
+def gemm_fp32_e4m3_e4m3(A, B, rounding="rtne", **kw):
     """FP32 → MXFP8 E4M3 × MXFP8 E4M3 GeMM."""
-    q = quantize_mxfp8e4_rtn if rounding == "rtn" else quantize_mxfp8e4_sr
+    q = quantize_mxfp8e4_rtne if rounding == "rtne" else quantize_mxfp8e4_sr
     return _e2e_gemm(A, B, "e4m3", "e4m3", q, q, **kw)
 
 
-def gemm_fp32_e5m2_e5m2(A, B, rounding="rtn", **kw):
+def gemm_fp32_e5m2_e5m2(A, B, rounding="rtne", **kw):
     """FP32 → MXFP8 E5M2 × MXFP8 E5M2 GeMM."""
-    q = quantize_mxfp8e5_rtn if rounding == "rtn" else quantize_mxfp8e5_sr
+    q = quantize_mxfp8e5_rtne if rounding == "rtne" else quantize_mxfp8e5_sr
     return _e2e_gemm(A, B, "e5m2", "e5m2", q, q, **kw)
 
 
-def gemm_fp32_e4m3_e5m2(A, B, rounding="rtn", **kw):
+def gemm_fp32_e4m3_e5m2(A, B, rounding="rtne", **kw):
     """FP32 → MXFP8 E4M3 × MXFP8 E5M2 GeMM (mixed)."""
-    qa = quantize_mxfp8e4_rtn if rounding == "rtn" else quantize_mxfp8e4_sr
-    qb = quantize_mxfp8e5_rtn if rounding == "rtn" else quantize_mxfp8e5_sr
+    qa = quantize_mxfp8e4_rtne if rounding == "rtne" else quantize_mxfp8e4_sr
+    qb = quantize_mxfp8e5_rtne if rounding == "rtne" else quantize_mxfp8e5_sr
     return _e2e_gemm(A, B, "e4m3", "e5m2", qa, qb, **kw)
 
 
 def gemm_fp32_e4m3_e2m1(A, B, **kw):
     """FP32 → MXFP8 E4M3 × MXFP4 E2M1 GeMM (mixed precision)."""
     return _e2e_gemm(A, B, "e4m3", "e2m1",
-                     quantize_mxfp8e4_rtn, quantize_mxfp4_rtn, **kw)
+                     quantize_mxfp8e4_rtne, quantize_mxfp4_rtne, **kw)
 
 
 def gemm_fp32_e2m1_e4m3(A, B, **kw):
     """FP32 → MXFP4 E2M1 × MXFP8 E4M3 GeMM (mixed precision)."""
     return _e2e_gemm(A, B, "e2m1", "e4m3",
-                     quantize_mxfp4_rtn, quantize_mxfp8e4_rtn, **kw)
+                     quantize_mxfp4_rtne, quantize_mxfp8e4_rtne, **kw)
 
 
 def gemm_fp32_e2m1_e2m1(A, B, **kw):
     """FP32 → MXFP4 E2M1 × MXFP4 E2M1 GeMM."""
     return _e2e_gemm(A, B, "e2m1", "e2m1",
-                     quantize_mxfp4_rtn, quantize_mxfp4_rtn, **kw)
+                     quantize_mxfp4_rtne, quantize_mxfp4_rtne, **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +203,30 @@ def gemm_fp32_e2m1_e2m1(A, B, **kw):
 # ---------------------------------------------------------------------------
 
 def _run_tests():
+    try:
+        import tcast
+        _TCAST_DICT = {
+            "e4m3": tcast.mxfp8e4,
+            "e5m2": tcast.mxfp8e5,
+            "e2m1": tcast.mxfp4e2,
+        }
+        _tcast_available = True
+    except ImportError:
+        _tcast_available = False
+
+    def _tcast_gemm(A, B, afmt, bfmt):
+        """Run GEMM using tcast-quantized tensors; return C [M, N] float32."""
+        from mxfp468_gemm import get_scale_element_tcast
+        A_q, As, _ = get_scale_element_tcast(A, afmt)
+        B_q, Bs, _ = get_scale_element_tcast(B, bfmt)
+        return mxfp4fp8_gemm(
+            A_q, B_q, As, Bs,
+            afmt=afmt, bfmt=bfmt,
+            BM=BM, BN=BN, BK=BK,
+            group_m=GROUP_M, num_warps=NUM_WARPS, num_stages=NUM_STAGES,
+            nonkdim=NONKDIM, out_dtype=torch.float32,
+        )
+
     torch.manual_seed(42)
 
     M = N = K = 4096
@@ -213,47 +237,50 @@ def _run_tests():
     NUM_STAGES = 2
     NONKDIM = 16
 
-    print(f"=== mxfp4fp8_gemm test bench  M=N=K={M} ===\n")
+    print(f"=== mxfp4fp8_gemm test bench  M=N=K={M} ===")
+    print(f"    tcast available: {_tcast_available}\n")
 
     A = torch.randn((M, K), device="cuda", dtype=torch.float32)
     B = torch.randn((N, K), device="cuda", dtype=torch.float32)
 
-    # Reference: FP32 matmul
     C_ref = A @ B.T
 
+    # (label, fn, extra_kw, (afmt, bfmt) for tcast comparison or None)
     gemm_configs = [
-        ("E4M3 × E4M3  RTN", gemm_fp32_e4m3_e4m3,
-         dict(rounding="rtn")),
-        ("E4M3 × E4M3  SR ", gemm_fp32_e4m3_e4m3,
-         dict(rounding="sr")),
-        ("E5M2 × E5M2  RTN", gemm_fp32_e5m2_e5m2,
-         dict(rounding="rtn")),
-        ("E4M3 × E5M2  RTN", gemm_fp32_e4m3_e5m2,
-         dict(rounding="rtn")),
-        ("E4M3 × E2M1  RTN", gemm_fp32_e4m3_e2m1,
-         dict()),
-        ("E2M1 × E4M3  RTN", gemm_fp32_e2m1_e4m3,
-         dict()),
-        ("E2M1 × E2M1  RTN", gemm_fp32_e2m1_e2m1,
-         dict()),
+        ("E4M3 × E4M3  RTNE", gemm_fp32_e4m3_e4m3, dict(rounding="rtne"), ("e4m3", "e4m3")),
+        ("E4M3 × E4M3  SR  ", gemm_fp32_e4m3_e4m3, dict(rounding="sr"),   ("e4m3", "e4m3")),
+        ("E5M2 × E5M2  RTNE", gemm_fp32_e5m2_e5m2, dict(rounding="rtne"), ("e5m2", "e5m2")),
+        ("E4M3 × E5M2  RTNE", gemm_fp32_e4m3_e5m2, dict(rounding="rtne"), ("e4m3", "e5m2")),
+        ("E4M3 × E2M1  RTNE", gemm_fp32_e4m3_e2m1, dict(),                ("e4m3", "e2m1")),
+        ("E2M1 × E4M3  RTNE", gemm_fp32_e2m1_e4m3, dict(),                ("e2m1", "e4m3")),
+        ("E2M1 × E2M1  RTNE", gemm_fp32_e2m1_e2m1, dict(),                ("e2m1", "e2m1")),
     ]
 
     common = dict(BM=BM, BN=BN, BK=BK, group_m=GROUP_M,
                   num_warps=NUM_WARPS, num_stages=NUM_STAGES,
                   nonkdim=NONKDIM, out_dtype=torch.float32)
 
-    for name, fn, extra_kw in gemm_configs:
+    for name, fn, extra_kw, tc_fmts in gemm_configs:
         kw = {**common, **extra_kw}
         try:
             C = fn(A, B, **kw)
             l_inf = torch.max(torch.abs(C - C_ref)).item()
             rel   = (l_inf / torch.max(torch.abs(C_ref)).item()) * 100
 
+            tc_suffix = ""
+            if _tcast_available and tc_fmts is not None:
+                try:
+                    C_tc = _tcast_gemm(A, B, *tc_fmts)
+                    l_inf_vs_tc = torch.max(torch.abs(C - C_tc)).item()
+                    tc_suffix = f"  vs_tcast={l_inf_vs_tc:.3f}"
+                except Exception as tc_e:
+                    tc_suffix = f"  vs_tcast=ERR({tc_e})"
+
             ms = tt.do_bench(lambda: fn(A, B, **kw), warmup=10, rep=500)
             tflops = 2 * M * N * K / (ms * 1e-3) / 1e12
 
-            print(f"  {name}: L_inf={l_inf:.3f} ({rel:.1f}%)  "
-                  f"time={ms:.4f} ms  {tflops:.3f} TFLOPS")
+            print(f"  {name}: L_inf={l_inf:.3f} ({rel:.1f}%)"
+                  f"  time={ms:.4f} ms  {tflops:.3f} TFLOPS{tc_suffix}")
         except Exception as e:
             import traceback
             print(f"  {name}: FAILED — {e}")
@@ -263,8 +290,8 @@ def _run_tests():
 
     # ---- standalone pre-quantized GEMM example ----
     print("--- Pre-quantized path (mxfp4fp8_gemm directly) ---")
-    A_q, As = quantize_mxfp8e4_rtn(A)
-    B_q, Bs = quantize_mxfp4_rtn(B)
+    A_q, As = quantize_mxfp8e4_rtne(A)
+    B_q, Bs = quantize_mxfp4_rtne(B)
 
     C_mixed = mxfp4fp8_gemm(
         A_q, B_q, As, Bs,

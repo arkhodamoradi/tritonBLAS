@@ -17,9 +17,9 @@ exponents.
 
 Importable example::
 
-    from mxfp4fp8_quantization import quantize_mxfp8e4_rtn, quantize_mxfp4_rtn
-    fp8, scales = quantize_mxfp8e4_rtn(x)
-    fp4, scales = quantize_mxfp4_rtn(x)
+    from mxfp4fp8_quantization import quantize_mxfp8e4_rtne, quantize_mxfp4_rtne
+    fp8, scales = quantize_mxfp8e4_rtne(x)
+    fp4, scales = quantize_mxfp4_rtne(x)
 """
 
 import torch
@@ -30,13 +30,13 @@ __all__ = [
     # helpers
     "fp4_e2m1_to_fp32",
     # FP8 E4M3 (e4m3fn)
-    "quantize_mxfp8e4_rtn",
+    "quantize_mxfp8e4_rtne",
     "quantize_mxfp8e4_sr",
     # FP8 E5M2
-    "quantize_mxfp8e5_rtn",
+    "quantize_mxfp8e5_rtne",
     "quantize_mxfp8e5_sr",
     # FP4 E2M1
-    "quantize_mxfp4_rtn",
+    "quantize_mxfp4_rtne",
 ]
 
 # ---------------------------------------------------------------------------
@@ -56,11 +56,11 @@ def _get_exponent(x, offset):
 
 
 # ---------------------------------------------------------------------------
-# MXFP8 E4M3 – RTN (round-to-nearest-even) via hardware packed instruction
+# MXFP8 E4M3 – RTNE (round-to-nearest-even) via hardware packed instruction
 # ---------------------------------------------------------------------------
 
 @triton.jit
-def _f32_to_mxfp8e4_rtn_kernel(
+def _f32_to_mxfp8e4_rtne_kernel(
     x_ptr, out_ptr, scale_ptr,
     M, K,
     stride_xm, stride_xk,
@@ -70,7 +70,7 @@ def _f32_to_mxfp8e4_rtn_kernel(
     GROUPS_PER_BLOCK: tl.constexpr,
 ):
     """
-    Convert FP32 → MXFP8 E4M3 with RTN using v_cvt_scalef32_pk_fp8_f32.
+    Convert FP32 → MXFP8 E4M3 with RTNE using v_cvt_scalef32_pk_fp8_f32.
     Each program handles GROUPS_PER_BLOCK groups along the K dimension.
     """
     pid_m = tl.program_id(0)
@@ -181,11 +181,11 @@ def _f32_to_mxfp8e4_sr_kernel(
 
 
 # ---------------------------------------------------------------------------
-# MXFP8 E5M2 – RTN via v_cvt_scalef32_pk_bf8_f32
+# MXFP8 E5M2 – RTNE via v_cvt_scalef32_pk_bf8_f32
 # ---------------------------------------------------------------------------
 
 @triton.jit
-def _f32_to_mxfp8e5_rtn_kernel(
+def _f32_to_mxfp8e5_rtne_kernel(
     x_ptr, out_ptr, scale_ptr,
     M, K,
     stride_xm, stride_xk,
@@ -301,11 +301,11 @@ def _f32_to_mxfp8e5_sr_kernel(
 
 
 # ---------------------------------------------------------------------------
-# MXFP4 E2M1 – RTN via v_cvt_scalef32_pk_fp4_f32
+# MXFP4 E2M1 – RTNE via v_cvt_scalef32_pk_fp4_f32
 # ---------------------------------------------------------------------------
 
 @triton.jit
-def _f32_to_mxfp4_rtn_kernel(
+def _f32_to_mxfp4_rtne_kernel(
     x_ptr, out_ptr, scale_ptr,
     M, K,
     stride_xm, stride_xk,
@@ -315,7 +315,7 @@ def _f32_to_mxfp4_rtn_kernel(
     GROUPS_PER_BLOCK: tl.constexpr,
 ):
     """
-    Convert FP32 → MXFP4 E2M1 with RTN using v_cvt_scalef32_pk_fp4_f32.
+    Convert FP32 → MXFP4 E2M1 with RTNE using v_cvt_scalef32_pk_fp4_f32.
     Each output byte holds two FP4 nibbles (low=even, high=odd).
     """
     pid_m = tl.program_id(0)
@@ -373,7 +373,7 @@ def _check_shape(x: torch.Tensor, group_size: int):
     return M, K
 
 
-def quantize_mxfp8e4_rtn(
+def quantize_mxfp8e4_rtne(
     x: torch.Tensor,
     group_size: int = 32,
     groups_per_block: int = 16,
@@ -393,7 +393,7 @@ def quantize_mxfp8e4_rtn(
     scales = torch.empty((M, n_groups), dtype=torch.uint8, device=x.device)
 
     grid = (M, n_groups // groups_per_block)
-    _f32_to_mxfp8e4_rtn_kernel[grid](
+    _f32_to_mxfp8e4_rtne_kernel[grid](
         x, out, scales, M, K,
         x.stride(0), x.stride(1),
         out.stride(0), out.stride(1),
@@ -437,7 +437,7 @@ def quantize_mxfp8e4_sr(
     return out.view(torch.float8_e4m3fn), scales
 
 
-def quantize_mxfp8e5_rtn(
+def quantize_mxfp8e5_rtne(
     x: torch.Tensor,
     group_size: int = 32,
     groups_per_block: int = 16,
@@ -457,7 +457,7 @@ def quantize_mxfp8e5_rtn(
     scales = torch.empty((M, n_groups), dtype=torch.uint8, device=x.device)
 
     grid = (M, n_groups // groups_per_block)
-    _f32_to_mxfp8e5_rtn_kernel[grid](
+    _f32_to_mxfp8e5_rtne_kernel[grid](
         x, out, scales, M, K,
         x.stride(0), x.stride(1),
         out.stride(0), out.stride(1),
@@ -501,7 +501,7 @@ def quantize_mxfp8e5_sr(
     return out.view(torch.float8_e5m2), scales
 
 
-def quantize_mxfp4_rtn(
+def quantize_mxfp4_rtne(
     x: torch.Tensor,
     group_size: int = 32,
     groups_per_block: int = 16,
@@ -521,7 +521,7 @@ def quantize_mxfp4_rtn(
     scales = torch.empty((M, n_groups), dtype=torch.uint8, device=x.device)
 
     grid = (M, n_groups // groups_per_block)
-    _f32_to_mxfp4_rtn_kernel[grid](
+    _f32_to_mxfp4_rtne_kernel[grid](
         x, out, scales, M, K,
         x.stride(0), x.stride(1),
         out.stride(0), out.stride(1),
@@ -577,25 +577,57 @@ def fp4_e2m1_to_fp32(packed: torch.Tensor) -> torch.Tensor:
 def _run_tests():
     import triton.testing as tt
 
+    try:
+        import tcast
+        _TCAST_DICT = {
+            "e4m3": tcast.mxfp8e4,
+            "e5m2": tcast.mxfp8e5,
+            "e2m1": tcast.mxfp4e2,
+        }
+        _tcast_available = True
+    except ImportError:
+        _tcast_available = False
+
+    def _tcast_quantize(x, fmt):
+        """Return (quantized_fp32_values, scales_uint8) from tcast, matching our layout."""
+        tc = tcast.cast(x, _TCAST_DICT[fmt])
+        tc_scale = tc.scaledata.scale.to(torch.uint8).T.reshape(x.shape[0], -1)
+        tc_s = 2.0 ** ((tc.scaledata.scale - 127).float()).T  # [M, n_groups]
+        tc_s_broad = tc_s.reshape(x.shape[0], -1).repeat_interleave(32, dim=1)
+        if fmt == "e4m3":
+            tc_q = (tc.tensor.view(x.shape[0], -1, 32) /
+                    tc_s.view(x.shape[0], -1).unsqueeze(-1)
+                    ).to(torch.float8_e4m3fn).reshape(x.shape)
+        elif fmt == "e5m2":
+            tc_q = (tc.tensor.view(x.shape[0], -1, 32) /
+                    tc_s.view(x.shape[0], -1).unsqueeze(-1)
+                    ).to(torch.float8_e5m2).reshape(x.shape)
+        else:  # e2m1 – tcast stores as bfloat16
+            tc_q = (tc.tensor.view(x.shape[0], -1, 32) /
+                    tc_s.view(x.shape[0], -1).unsqueeze(-1)
+                    ).to(torch.bfloat16).reshape(x.shape)
+        return tc_q, tc_scale, tc_s_broad
+
     torch.manual_seed(42)
     M, K = 4096, 4096
     GROUP_SIZE = 32
 
-    print(f"=== mxfp4fp8_quantization test bench  M={M} K={K} group={GROUP_SIZE} ===\n")
+    print(f"=== mxfp4fp8_quantization test bench  M={M} K={K} group={GROUP_SIZE} ===")
+    print(f"    tcast available: {_tcast_available}\n")
 
     x = torch.randn((M, K), device="cuda", dtype=torch.float32)
 
+    # (label, fn, kwargs, tcast_fmt)
     configs = [
-        ("MXFP8 E4M3  RTN", quantize_mxfp8e4_rtn, dict(group_size=GROUP_SIZE, groups_per_block=16)),
-        ("MXFP8 E4M3  SR ", quantize_mxfp8e4_sr,  dict(group_size=GROUP_SIZE, groups_per_block=256)),
-        ("MXFP8 E5M2  RTN", quantize_mxfp8e5_rtn, dict(group_size=GROUP_SIZE, groups_per_block=16)),
-        ("MXFP8 E5M2  SR ", quantize_mxfp8e5_sr,  dict(group_size=GROUP_SIZE, groups_per_block=256)),
-        ("MXFP4 E2M1  RTN", quantize_mxfp4_rtn,   dict(group_size=GROUP_SIZE, groups_per_block=16)),
+        ("MXFP8 E4M3  RTNE", quantize_mxfp8e4_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16),  "e4m3"),
+        ("MXFP8 E4M3  SR  ", quantize_mxfp8e4_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256), "e4m3"),
+        ("MXFP8 E5M2  RTNE", quantize_mxfp8e5_rtne, dict(group_size=GROUP_SIZE, groups_per_block=16),  "e5m2"),
+        ("MXFP8 E5M2  SR  ", quantize_mxfp8e5_sr,   dict(group_size=GROUP_SIZE, groups_per_block=256), "e5m2"),
+        ("MXFP4 E2M1  RTNE", quantize_mxfp4_rtne,   dict(group_size=GROUP_SIZE, groups_per_block=16),  "e2m1"),
     ]
 
-    for name, fn, kwargs in configs:
+    for name, fn, kwargs, tc_fmt in configs:
         try:
-            # correctness: output dtype and shape
             q, s = fn(x, **kwargs)
             assert s.shape == (M, K // GROUP_SIZE), f"scale shape mismatch: {s.shape}"
             assert s.dtype == torch.uint8
@@ -606,28 +638,39 @@ def _run_tests():
             elif "E5M2" in name:
                 assert q.dtype == torch.float8_e5m2, f"wrong dtype {q.dtype}"
                 assert q.shape == (M, K)
-            else:  # FP4
+            else:
                 assert q.dtype == torch.uint8
                 assert q.shape == (M, K // 2)
 
-            # round-trip error (scale the quantized values back to FP32 and compare)
-            if "FP4" not in name and "E2M1" not in name:
-                s_f32 = (2.0 ** (s.float() - 127))          # [M, n_groups]
-                s_broadcast = s_f32.repeat_interleave(GROUP_SIZE, dim=1)  # [M, K]
-                x_recon = q.float() * s_broadcast
-                l_inf = torch.max(torch.abs(x_recon - x)).item()
+            # Round-trip L_inf vs original FP32
+            s_f32 = (2.0 ** (s.float() - 127)).repeat_interleave(GROUP_SIZE, dim=1)
+            if "E2M1" in name:
+                x_recon = fp4_e2m1_to_fp32(q) * s_f32
             else:
-                x_recon = fp4_e2m1_to_fp32(q)               # [M, K]
-                s_f32 = (2.0 ** (s.float() - 127))
-                s_broadcast = s_f32.repeat_interleave(GROUP_SIZE, dim=1)
-                x_recon = x_recon * s_broadcast
-                l_inf = torch.max(torch.abs(x_recon - x)).item()
+                x_recon = q.float() * s_f32
+            l_inf_fp32 = torch.max(torch.abs(x_recon - x)).item()
 
-            # throughput
+            # Optional: L_inf vs tcast reference
+            tc_suffix = ""
+            if _tcast_available:
+                tc_q, tc_scale, tc_s_broad = _tcast_quantize(x, tc_fmt)
+                # compare scales
+                l_inf_scale = torch.max(torch.abs(s.float() - tc_scale.float())).item()
+                # compare dequantized values
+                if "E2M1" in name:
+                    # tcast returns bfloat16; compare dequantized fp32
+                    tc_recon = tc_q.float() * tc_s_broad
+                    x_recon_tc = fp4_e2m1_to_fp32(q) * s_f32
+                    l_inf_vs_tc = torch.max(torch.abs(x_recon_tc - tc_recon)).item()
+                else:
+                    tc_recon = tc_q.float() * tc_s_broad
+                    l_inf_vs_tc = torch.max(torch.abs(x_recon - tc_recon)).item()
+                tc_suffix = f"  vs_tcast(scale={l_inf_scale:.1f}, val={l_inf_vs_tc:.4f})"
+
             ms = tt.do_bench(lambda: fn(x, **kwargs), warmup=25, rep=500)
-            gbps = x.numel() * 4 / (ms * 1e-3) / 1e9   # GB/s read (FP32 input)
+            gbps = x.numel() * 4 / (ms * 1e-3) / 1e9
 
-            print(f"  {name}: L_inf={l_inf:.4f}  time={ms:.4f} ms  read_bw={gbps:.1f} GB/s")
+            print(f"  {name}: L_inf={l_inf_fp32:.4f}  time={ms:.4f} ms  read_bw={gbps:.1f} GB/s{tc_suffix}")
 
         except Exception as e:
             import traceback
