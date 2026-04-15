@@ -453,14 +453,16 @@ def _f16_to_mxfp8e4_rtne_kernel(
     )
     scale_f32 = (tl.reshape(scale_exp_broad, (BLOCK_SIZE // 2,)).to(tl.uint32) << 23)
 
-    # Feed native FP16 values to the FP16-aware conversion instruction
-    x_pairs = tl.reshape(x_f16, (BLOCK_SIZE // 2, 2))
-    x_even, x_odd = tl.split(x_pairs)
+    # Pack adjacent FP16 pairs into uint32 (lo=first, hi=second in each 32-bit reg)
+    x_u16 = x_f16.to(tl.uint16, bitcast=True)
+    x_pairs = tl.reshape(x_u16, (BLOCK_SIZE // 2, 2))
+    x_lo, x_hi = tl.split(x_pairs)
+    x_pk = x_lo.to(tl.uint32) | (x_hi.to(tl.uint32) << 16)
 
     fp8_packed = tl.inline_asm_elementwise(
-        "v_cvt_scalef32_pk_fp8_f16 $0, $1, $2, $3",
-        "=v,v,v,v",
-        args=[x_even, x_odd, scale_f32],
+        "v_cvt_scalef32_pk_fp8_f16 $0, $1, $2",
+        "=v,v,v",
+        args=[x_pk, scale_f32],
         dtype=tl.uint16, is_pure=True, pack=1,
     )
 
