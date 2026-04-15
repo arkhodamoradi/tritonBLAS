@@ -421,8 +421,9 @@ def _f16_to_mxfp8e4_rtne_kernel(
     MIDMAX_VAL: tl.constexpr = 464.0,
 ):
     """
-    Convert FP16 → MXFP8 E4M3 with RTNE using v_cvt_scalef32_pk_fp8_f32.
-    FP16 values are upcast to FP32 before scale computation and conversion.
+    Convert FP16 → MXFP8 E4M3 with RTNE using v_cvt_scalef32_pk_fp8_f16.
+    FP16 values are upcast to FP32 only for scale (E8M0 exponent) computation;
+    the native FP16 values are passed directly to the conversion instruction.
     """
     pid_m = tl.program_id(0)
     pid_g = tl.program_id(1)
@@ -432,11 +433,12 @@ def _f16_to_mxfp8e4_rtne_kernel(
     block_start = pid_g * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
 
-    # Load FP16 and upcast to FP32 for scale computation and asm instruction
-    x = tl.load(x_ptr + pid_m * stride_xm + offsets * stride_xk,
-                 mask=offsets < K, other=0.0).to(tl.float32)
+    # Load FP16; upcast to FP32 only for scale (exponent) computation
+    x_f16 = tl.load(x_ptr + pid_m * stride_xm + offsets * stride_xk,
+                     mask=offsets < K, other=0.0)
+    x_f32 = x_f16.to(tl.float32)
 
-    x_grouped = tl.reshape(x, (GROUPS_PER_BLOCK, GROUP_SIZE))
+    x_grouped = tl.reshape(x_f32, (GROUPS_PER_BLOCK, GROUP_SIZE))
     scale_exp = _get_exponent_midmax(x_grouped, 8, MIDMAX_VAL) if MIDMAX else _get_exponent(x_grouped, 8)
 
     group_indices = tl.arange(0, GROUPS_PER_BLOCK)
@@ -451,11 +453,12 @@ def _f16_to_mxfp8e4_rtne_kernel(
     )
     scale_f32 = (tl.reshape(scale_exp_broad, (BLOCK_SIZE // 2,)).to(tl.uint32) << 23)
 
-    x_pairs = tl.reshape(x, (BLOCK_SIZE // 2, 2))
+    # Feed native FP16 values to the FP16-aware conversion instruction
+    x_pairs = tl.reshape(x_f16, (BLOCK_SIZE // 2, 2))
     x_even, x_odd = tl.split(x_pairs)
 
     fp8_packed = tl.inline_asm_elementwise(
-        "v_cvt_scalef32_pk_fp8_f32 $0, $1, $2, $3",
+        "v_cvt_scalef32_pk_fp8_f16 $0, $1, $2, $3",
         "=v,v,v,v",
         args=[x_even, x_odd, scale_f32],
         dtype=tl.uint16, is_pure=True, pack=1,
