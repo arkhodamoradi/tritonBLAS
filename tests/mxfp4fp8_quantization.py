@@ -498,11 +498,8 @@ def _f16_to_mxfp8e4_rtne_kernel(
     )
     scale_f32 = (tl.reshape(scale_exp_broad, (BLOCK_SIZE // 2,)).to(tl.uint32) << 23)
 
-    # Pack adjacent FP16 pairs into uint32 (lo=first, hi=second in each 32-bit reg)
-    x_u16 = x_f16.to(tl.uint16, bitcast=True)
-    x_pairs = tl.reshape(x_u16, (BLOCK_SIZE // 2, 2))
-    x_lo, x_hi = tl.split(x_pairs)
-    x_pk = x_lo.to(tl.uint32) | (x_hi.to(tl.uint32) << 16)
+    x_lo, x_hi = tl.split(tl.reshape(x_f16, (BLOCK_SIZE // 2, 2)))
+    x_pk = (x_lo.to(tl.uint16, bitcast=True).to(tl.uint32) | (x_hi.to(tl.uint16, bitcast=True).to(tl.uint32) << 16)).to(tl.float32, bitcast=True)
 
     fp8_packed = tl.inline_asm_elementwise(
         "v_cvt_scalef32_pk_fp8_f16 $0, $1, $2",
