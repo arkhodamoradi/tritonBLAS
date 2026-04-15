@@ -42,11 +42,13 @@ __all__ = [
     "quantize_mxfp8e4_sr_from_f16",
     "quantize_mxfp8e5_rtne_from_f16",
     "quantize_mxfp8e5_sr_from_f16",
+    "quantize_mxfp4_rtne_from_f16",
     # BF16 input
     "quantize_mxfp8e4_rtne_from_bf16",
     "quantize_mxfp8e4_sr_from_bf16",
     "quantize_mxfp8e5_rtne_from_bf16",
     "quantize_mxfp8e5_sr_from_bf16",
+    "quantize_mxfp4_rtne_from_bf16",
 ]
 
 # ---------------------------------------------------------------------------
@@ -1005,6 +1007,134 @@ def _bf16_to_mxfp8e5_sr_kernel(
 
 
 # ---------------------------------------------------------------------------
+# MXFP4 E2M1 – RTNE from FP16 via v_cvt_scalef32_pk_fp4_f16
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _f16_to_mxfp4_rtne_kernel(
+    x_ptr, out_ptr, scale_ptr,
+    M, K,
+    stride_xm, stride_xk,
+    stride_outm, stride_outk,
+    stride_sm, stride_sg,
+    GROUP_SIZE: tl.constexpr,
+    GROUPS_PER_BLOCK: tl.constexpr,
+    MIDMAX: tl.constexpr = False,
+    MIDMAX_VAL: tl.constexpr = 7.0,
+):
+    """
+    Convert FP16 → MXFP4 E2M1 with RTNE using v_cvt_scalef32_pk_fp4_f16.
+    Scale (E8M0 exponent) computation uses _get_exponent_f16 (offset=2).
+    """
+    pid_m = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    BLOCK_SIZE: tl.constexpr = GROUP_SIZE * GROUPS_PER_BLOCK
+
+    block_start = pid_g * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+
+    x_f16 = tl.load(x_ptr + pid_m * stride_xm + offsets * stride_xk,
+                     mask=offsets < K, other=0.0)
+
+    x_grouped = tl.reshape(x_f16, (GROUPS_PER_BLOCK, GROUP_SIZE))
+    scale_exp = _get_exponent_midmax_f16(x_grouped, 2, MIDMAX_VAL) if MIDMAX else _get_exponent_f16(x_grouped, 2)
+
+    group_indices = tl.arange(0, GROUPS_PER_BLOCK)
+    g_abs = pid_g * GROUPS_PER_BLOCK + group_indices
+    tl.store(scale_ptr + pid_m * stride_sm + g_abs * stride_sg,
+             scale_exp.to(tl.uint8),
+             mask=g_abs < (K // GROUP_SIZE))
+
+    scale_exp_broad = tl.broadcast_to(
+        tl.reshape(scale_exp, (GROUPS_PER_BLOCK, 1)),
+        (GROUPS_PER_BLOCK, GROUP_SIZE // 2),
+    )
+    scale_f32 = (tl.reshape(scale_exp_broad, (BLOCK_SIZE // 2,)).to(tl.uint32) << 23)
+
+    x_lo, x_hi = tl.split(tl.reshape(x_f16, (BLOCK_SIZE // 2, 2)))
+    x_pk = (x_lo.to(tl.uint16, bitcast=True).to(tl.uint32) | (x_hi.to(tl.uint16, bitcast=True).to(tl.uint32) << 16)).to(tl.float32, bitcast=True)
+
+    fp4_packed = tl.inline_asm_elementwise(
+        "v_cvt_scalef32_pk_fp4_f16 $0, $1, $2",
+        "=v,v,v",
+        args=[x_pk, scale_f32],
+        dtype=tl.uint16, is_pure=True, pack=1,
+    )
+
+    fp4 = fp4_packed.to(tl.uint8)
+
+    pair_offsets = tl.arange(0, BLOCK_SIZE // 2)
+    out_byte_offsets = block_start // 2 + pair_offsets
+    tl.store(out_ptr + pid_m * stride_outm + out_byte_offsets * stride_outk,
+             fp4, mask=out_byte_offsets < (K // 2))
+
+
+# ---------------------------------------------------------------------------
+# MXFP4 E2M1 – RTNE from BF16 via v_cvt_scalef32_pk_fp4_bf16
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _bf16_to_mxfp4_rtne_kernel(
+    x_ptr, out_ptr, scale_ptr,
+    M, K,
+    stride_xm, stride_xk,
+    stride_outm, stride_outk,
+    stride_sm, stride_sg,
+    GROUP_SIZE: tl.constexpr,
+    GROUPS_PER_BLOCK: tl.constexpr,
+    MIDMAX: tl.constexpr = False,
+    MIDMAX_VAL: tl.constexpr = 7.0,
+):
+    """
+    Convert BF16 → MXFP4 E2M1 with RTNE using v_cvt_scalef32_pk_fp4_bf16.
+    Scale (E8M0 exponent) computation uses _get_exponent_bf16 (offset=2).
+    """
+    pid_m = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    BLOCK_SIZE: tl.constexpr = GROUP_SIZE * GROUPS_PER_BLOCK
+
+    block_start = pid_g * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+
+    x_bf16 = tl.load(x_ptr + pid_m * stride_xm + offsets * stride_xk,
+                      mask=offsets < K, other=0.0)
+
+    x_grouped = tl.reshape(x_bf16, (GROUPS_PER_BLOCK, GROUP_SIZE))
+    scale_exp = _get_exponent_midmax_bf16(x_grouped, 2, MIDMAX_VAL) if MIDMAX else _get_exponent_bf16(x_grouped, 2)
+
+    group_indices = tl.arange(0, GROUPS_PER_BLOCK)
+    g_abs = pid_g * GROUPS_PER_BLOCK + group_indices
+    tl.store(scale_ptr + pid_m * stride_sm + g_abs * stride_sg,
+             scale_exp.to(tl.uint8),
+             mask=g_abs < (K // GROUP_SIZE))
+
+    scale_exp_broad = tl.broadcast_to(
+        tl.reshape(scale_exp, (GROUPS_PER_BLOCK, 1)),
+        (GROUPS_PER_BLOCK, GROUP_SIZE // 2),
+    )
+    scale_f32 = (tl.reshape(scale_exp_broad, (BLOCK_SIZE // 2,)).to(tl.uint32) << 23)
+
+    x_lo, x_hi = tl.split(tl.reshape(x_bf16, (BLOCK_SIZE // 2, 2)))
+    x_pk = (x_lo.to(tl.uint16, bitcast=True).to(tl.uint32) | (x_hi.to(tl.uint16, bitcast=True).to(tl.uint32) << 16)).to(tl.float32, bitcast=True)
+
+    fp4_packed = tl.inline_asm_elementwise(
+        "v_cvt_scalef32_pk_fp4_bf16 $0, $1, $2",
+        "=v,v,v",
+        args=[x_pk, scale_f32],
+        dtype=tl.uint16, is_pure=True, pack=1,
+    )
+
+    fp4 = fp4_packed.to(tl.uint8)
+
+    pair_offsets = tl.arange(0, BLOCK_SIZE // 2)
+    out_byte_offsets = block_start // 2 + pair_offsets
+    tl.store(out_ptr + pid_m * stride_outm + out_byte_offsets * stride_outk,
+             fp4, mask=out_byte_offsets < (K // 2))
+
+
+# ---------------------------------------------------------------------------
 # Public Python wrappers
 # ---------------------------------------------------------------------------
 
@@ -1439,6 +1569,70 @@ def quantize_mxfp8e5_sr_from_bf16(
     return out.view(torch.float8_e5m2), scales
 
 
+def quantize_mxfp4_rtne_from_f16(
+    x: torch.Tensor,
+    group_size: int = 32,
+    groups_per_block: int = 16,
+    num_warps: int = 4,
+    midmax: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    FP16 → MXFP4 E2M1 (round-to-nearest-even).
+
+    Returns
+    -------
+    fp4   : torch.uint8 tensor [M, K // 2]  (two nibbles packed per byte)
+    scales: torch.uint8 tensor [M, K // group_size]  (E8M0 exponents)
+    """
+    assert x.dtype == torch.float16, f"expected float16 input, got {x.dtype}"
+    M, K = _check_shape(x, group_size)
+    n_groups = K // group_size
+    out = torch.empty((M, K // 2), dtype=torch.uint8, device=x.device)
+    scales = torch.empty((M, n_groups), dtype=torch.uint8, device=x.device)
+    grid = (M, n_groups // groups_per_block)
+    _f16_to_mxfp4_rtne_kernel[grid](
+        x, out, scales, M, K,
+        x.stride(0), x.stride(1),
+        out.stride(0), out.stride(1),
+        scales.stride(0), scales.stride(1),
+        GROUP_SIZE=group_size, GROUPS_PER_BLOCK=groups_per_block,
+        MIDMAX=midmax, num_warps=num_warps,
+    )
+    return out, scales
+
+
+def quantize_mxfp4_rtne_from_bf16(
+    x: torch.Tensor,
+    group_size: int = 32,
+    groups_per_block: int = 16,
+    num_warps: int = 4,
+    midmax: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    BF16 → MXFP4 E2M1 (round-to-nearest-even).
+
+    Returns
+    -------
+    fp4   : torch.uint8 tensor [M, K // 2]  (two nibbles packed per byte)
+    scales: torch.uint8 tensor [M, K // group_size]  (E8M0 exponents)
+    """
+    assert x.dtype == torch.bfloat16, f"expected bfloat16 input, got {x.dtype}"
+    M, K = _check_shape(x, group_size)
+    n_groups = K // group_size
+    out = torch.empty((M, K // 2), dtype=torch.uint8, device=x.device)
+    scales = torch.empty((M, n_groups), dtype=torch.uint8, device=x.device)
+    grid = (M, n_groups // groups_per_block)
+    _bf16_to_mxfp4_rtne_kernel[grid](
+        x, out, scales, M, K,
+        x.stride(0), x.stride(1),
+        out.stride(0), out.stride(1),
+        scales.stride(0), scales.stride(1),
+        GROUP_SIZE=group_size, GROUPS_PER_BLOCK=groups_per_block,
+        MIDMAX=midmax, num_warps=num_warps,
+    )
+    return out, scales
+
+
 # ---------------------------------------------------------------------------
 # Decode helpers
 # ---------------------------------------------------------------------------
@@ -1615,19 +1809,29 @@ def _run_tests():
          dict(group_size=GROUP_SIZE, groups_per_block=256),              "e5m2", "max",    "stochastic"),
         ("MXFP8 E5M2  SR   f16 midmax", quantize_mxfp8e5_sr_from_f16,
          dict(group_size=GROUP_SIZE, groups_per_block=256, midmax=True), "e5m2", "midmax", "stochastic"),
+        ("MXFP4 E2M1  RTNE f16       ", quantize_mxfp4_rtne_from_f16,
+         dict(group_size=GROUP_SIZE, groups_per_block=16),               "e2m1", "max",    "even"),
+        ("MXFP4 E2M1  RTNE f16 midmax", quantize_mxfp4_rtne_from_f16,
+         dict(group_size=GROUP_SIZE, groups_per_block=16, midmax=True),  "e2m1", "midmax", "even"),
     ]
 
     for name, fn, kwargs, tc_fmt, tc_scalemode, tc_roundmode in f16_configs:
         try:
             q, s = fn(x_f16, **kwargs)
-            expected_dtype = torch.float8_e5m2 if "E5M2" in name else torch.float8_e4m3fn
-            assert q.dtype == expected_dtype, f"wrong dtype {q.dtype}"
-            assert q.shape == (M, K)
             assert s.shape == (M, K // GROUP_SIZE)
             assert s.dtype == torch.uint8
+            if "E2M1" in name:
+                assert q.dtype == torch.uint8
+                assert q.shape == (M, K // 2)
+            elif "E5M2" in name:
+                assert q.dtype == torch.float8_e5m2, f"wrong dtype {q.dtype}"
+                assert q.shape == (M, K)
+            else:
+                assert q.dtype == torch.float8_e4m3fn, f"wrong dtype {q.dtype}"
+                assert q.shape == (M, K)
 
             s_f32 = (2.0 ** (s.float() - 127)).repeat_interleave(GROUP_SIZE, dim=1)
-            x_recon = q.float() * s_f32
+            x_recon = fp4_e2m1_to_fp32(q) * s_f32 if "E2M1" in name else q.float() * s_f32
             l_inf_fp32 = torch.max(torch.abs(x_recon - x_f16_f32)).item()
 
             tc_suffix = ""
@@ -1635,8 +1839,12 @@ def _run_tests():
                 tc_q, tc_scale, tc_s_broad = _tcast_quantize(
                     x_f16_f32, tc_fmt, scalemode=tc_scalemode, roundmode=tc_roundmode)
                 l_inf_scale = torch.max(torch.abs(s.float() - tc_scale.float())).item()
-                tc_recon = tc_q.float() * tc_s_broad
-                l_inf_vs_tc = torch.max(torch.abs(x_recon - tc_recon)).item()
+                if "E2M1" in name:
+                    tc_recon = tc_q.float() * tc_s_broad
+                    l_inf_vs_tc = torch.max(torch.abs(x_recon - tc_recon)).item()
+                else:
+                    tc_recon = tc_q.float() * tc_s_broad
+                    l_inf_vs_tc = torch.max(torch.abs(x_recon - tc_recon)).item()
                 tc_suffix = f"  vs_tcast(L_inf scale={l_inf_scale:.1f}, L_inf val={l_inf_vs_tc:.4f})"
 
             ms = tt.do_bench(lambda: fn(x_f16, **kwargs), warmup=25, rep=500)
@@ -1676,19 +1884,29 @@ def _run_tests():
          dict(group_size=GROUP_SIZE, groups_per_block=256),              "e5m2", "max",    "stochastic"),
         ("MXFP8 E5M2  SR   bf16 midmax", quantize_mxfp8e5_sr_from_bf16,
          dict(group_size=GROUP_SIZE, groups_per_block=256, midmax=True), "e5m2", "midmax", "stochastic"),
+        ("MXFP4 E2M1  RTNE bf16       ", quantize_mxfp4_rtne_from_bf16,
+         dict(group_size=GROUP_SIZE, groups_per_block=16),               "e2m1", "max",    "even"),
+        ("MXFP4 E2M1  RTNE bf16 midmax", quantize_mxfp4_rtne_from_bf16,
+         dict(group_size=GROUP_SIZE, groups_per_block=16, midmax=True),  "e2m1", "midmax", "even"),
     ]
 
     for name, fn, kwargs, tc_fmt, tc_scalemode, tc_roundmode in bf16_configs:
         try:
             q, s = fn(x_bf16, **kwargs)
-            expected_dtype = torch.float8_e5m2 if "E5M2" in name else torch.float8_e4m3fn
-            assert q.dtype == expected_dtype, f"wrong dtype {q.dtype}"
-            assert q.shape == (M, K)
             assert s.shape == (M, K // GROUP_SIZE)
             assert s.dtype == torch.uint8
+            if "E2M1" in name:
+                assert q.dtype == torch.uint8
+                assert q.shape == (M, K // 2)
+            elif "E5M2" in name:
+                assert q.dtype == torch.float8_e5m2, f"wrong dtype {q.dtype}"
+                assert q.shape == (M, K)
+            else:
+                assert q.dtype == torch.float8_e4m3fn, f"wrong dtype {q.dtype}"
+                assert q.shape == (M, K)
 
             s_f32 = (2.0 ** (s.float() - 127)).repeat_interleave(GROUP_SIZE, dim=1)
-            x_recon = q.float() * s_f32
+            x_recon = fp4_e2m1_to_fp32(q) * s_f32 if "E2M1" in name else q.float() * s_f32
             l_inf_fp32 = torch.max(torch.abs(x_recon - x_bf16_f32)).item()
 
             tc_suffix = ""
@@ -1696,8 +1914,12 @@ def _run_tests():
                 tc_q, tc_scale, tc_s_broad = _tcast_quantize(
                     x_bf16_f32, tc_fmt, scalemode=tc_scalemode, roundmode=tc_roundmode)
                 l_inf_scale = torch.max(torch.abs(s.float() - tc_scale.float())).item()
-                tc_recon = tc_q.float() * tc_s_broad
-                l_inf_vs_tc = torch.max(torch.abs(x_recon - tc_recon)).item()
+                if "E2M1" in name:
+                    tc_recon = tc_q.float() * tc_s_broad
+                    l_inf_vs_tc = torch.max(torch.abs(x_recon - tc_recon)).item()
+                else:
+                    tc_recon = tc_q.float() * tc_s_broad
+                    l_inf_vs_tc = torch.max(torch.abs(x_recon - tc_recon)).item()
                 tc_suffix = f"  vs_tcast(L_inf scale={l_inf_scale:.1f}, L_inf val={l_inf_vs_tc:.4f})"
 
             ms = tt.do_bench(lambda: fn(x_bf16, **kwargs), warmup=25, rep=500)
