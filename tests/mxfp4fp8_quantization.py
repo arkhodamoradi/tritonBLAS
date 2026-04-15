@@ -88,6 +88,52 @@ def _get_exponent_midmax(x, offset, midmax: tl.constexpr):
 
 
 # ---------------------------------------------------------------------------
+# FP16-native exponent helpers (no FP32 upcast)
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _get_exponent_f16(x, offset):
+    """Return E8M0 exponent for each row of x [GROUPS, GROUP_SIZE] (FP16 input).
+
+    Extracts the 5-bit FP16 biased exponent (bias=15) directly from the
+    uint16 bit pattern and converts to the E8M0 scale exponent by adding
+    112 (= 127 − 15, the FP32-to-FP16 bias difference).
+    """
+    absmax = tl.max(tl.abs(x), axis=1)
+    absmax_bits = absmax.to(tl.uint16, bitcast=True)
+    fp16_exp = (absmax_bits >> 10) & 0x1F          # 5-bit biased FP16 exponent
+    exp = fp16_exp.to(tl.int32) + 112 - offset     # bias-correct to E8M0
+    exp = tl.maximum(exp, 0)
+    exp = tl.minimum(exp, 255)
+    return exp
+
+
+@triton.jit
+def _get_exponent_midmax_f16(x, offset, midmax: tl.constexpr):
+    """Return E8M0 exponent for each row of x [GROUPS, GROUP_SIZE] (FP16 input).
+
+    Applies the midmax threshold check entirely in FP16 space: the FP16
+    exponent field is replaced with (15 + offset) while the 10-bit mantissa
+    is preserved, normalising absmax into [2^offset, 2^(offset+1)).  If that
+    normalised value exceeds midmax the E8M0 exponent is incremented by 1.
+    """
+    absmax = tl.max(tl.abs(x), axis=1)
+    absmax_bits = absmax.to(tl.uint16, bitcast=True)
+    fp16_exp = (absmax_bits >> 10) & 0x1F
+    exp = fp16_exp.to(tl.int32) + 112 - offset
+
+    # Replace FP16 exponent with (15 + offset) to normalise absmax into
+    # [2^offset, 2^(offset+1)) without leaving FP16 space.
+    amax_scaled_bits = (absmax_bits & 0x03FF) | ((15 + offset) << 10)
+    amax_scaled = amax_scaled_bits.to(tl.float16, bitcast=True)
+
+    exp = exp + (amax_scaled.to(tl.float32) > midmax).to(tl.int32)
+    exp = tl.maximum(exp, 0)
+    exp = tl.minimum(exp, 255)
+    return exp
+
+
+# ---------------------------------------------------------------------------
 # MXFP8 E4M3 – RTNE (round-to-nearest-even) via hardware packed instruction
 # ---------------------------------------------------------------------------
 
@@ -433,13 +479,11 @@ def _f16_to_mxfp8e4_rtne_kernel(
     block_start = pid_g * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
 
-    # Load FP16; upcast to FP32 only for scale (exponent) computation
     x_f16 = tl.load(x_ptr + pid_m * stride_xm + offsets * stride_xk,
                      mask=offsets < K, other=0.0)
-    x_f32 = x_f16.to(tl.float32)
 
-    x_grouped = tl.reshape(x_f32, (GROUPS_PER_BLOCK, GROUP_SIZE))
-    scale_exp = _get_exponent_midmax(x_grouped, 8, MIDMAX_VAL) if MIDMAX else _get_exponent(x_grouped, 8)
+    x_grouped = tl.reshape(x_f16, (GROUPS_PER_BLOCK, GROUP_SIZE))
+    scale_exp = _get_exponent_midmax_f16(x_grouped, 8, MIDMAX_VAL) if MIDMAX else _get_exponent_f16(x_grouped, 8)
 
     group_indices = tl.arange(0, GROUPS_PER_BLOCK)
     g_abs = pid_g * GROUPS_PER_BLOCK + group_indices
