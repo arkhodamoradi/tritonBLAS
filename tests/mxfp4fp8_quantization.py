@@ -39,10 +39,14 @@ __all__ = [
     "quantize_mxfp4_rtne",
     # FP16 input
     "quantize_mxfp8e4_rtne_from_f16",
+    "quantize_mxfp8e4_sr_from_f16",
     "quantize_mxfp8e5_rtne_from_f16",
+    "quantize_mxfp8e5_sr_from_f16",
     # BF16 input
     "quantize_mxfp8e4_rtne_from_bf16",
+    "quantize_mxfp8e4_sr_from_bf16",
     "quantize_mxfp8e5_rtne_from_bf16",
+    "quantize_mxfp8e5_sr_from_bf16",
 ]
 
 # ---------------------------------------------------------------------------
@@ -775,6 +779,232 @@ def _bf16_to_mxfp8e5_rtne_kernel(
 
 
 # ---------------------------------------------------------------------------
+# MXFP8 E4M3 – SR from FP16 via v_cvt_scalef32_sr_fp8_f16
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _f16_to_mxfp8e4_sr_kernel(
+    x_ptr, out_ptr, scale_ptr,
+    M, K,
+    stride_xm, stride_xk,
+    stride_outm, stride_outk,
+    stride_sm, stride_sg,
+    GROUP_SIZE: tl.constexpr,
+    GROUPS_PER_BLOCK: tl.constexpr,
+    MIDMAX: tl.constexpr = False,
+    MIDMAX_VAL: tl.constexpr = 464.0,
+    SR_SEED: tl.constexpr = 0.5,
+):
+    pid_m = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    BLOCK_SIZE: tl.constexpr = GROUP_SIZE * GROUPS_PER_BLOCK
+
+    block_start = pid_g * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+
+    x_f16 = tl.load(x_ptr + pid_m * stride_xm + offsets * stride_xk,
+                     mask=offsets < K, other=0.0)
+
+    x_grouped = tl.reshape(x_f16, (GROUPS_PER_BLOCK, GROUP_SIZE))
+    scale_exp = _get_exponent_midmax_f16(x_grouped, 8, MIDMAX_VAL) if MIDMAX else _get_exponent_f16(x_grouped, 8)
+
+    group_indices = tl.arange(0, GROUPS_PER_BLOCK)
+    g_abs = pid_g * GROUPS_PER_BLOCK + group_indices
+    tl.store(scale_ptr + pid_m * stride_sm + g_abs * stride_sg,
+             scale_exp.to(tl.uint8),
+             mask=g_abs < (K // GROUP_SIZE))
+
+    scale_exp_broad = tl.broadcast_to(
+        tl.reshape(scale_exp, (GROUPS_PER_BLOCK, 1)),
+        (GROUPS_PER_BLOCK, GROUP_SIZE),
+    )
+    scale_f32 = (tl.reshape(scale_exp_broad, (BLOCK_SIZE,)).to(tl.uint32) << 23)
+
+    fp8 = tl.inline_asm_elementwise(
+        "v_cvt_scalef32_sr_fp8_f16 $0, $1, $2, $3",
+        "=v,v,v,v",
+        args=[x_f16, SR_SEED, scale_f32],
+        dtype=tl.uint16, is_pure=True, pack=1,
+    )
+    fp8 = fp8.to(tl.uint8)
+    fp8 = tl.where((fp8 & 0x7F) == 0x7F, fp8 - 1, fp8)
+
+    tl.store(out_ptr + pid_m * stride_outm + offsets * stride_outk,
+             fp8, mask=offsets < K)
+
+
+# ---------------------------------------------------------------------------
+# MXFP8 E4M3 – SR from BF16 via v_cvt_scalef32_sr_fp8_bf16
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _bf16_to_mxfp8e4_sr_kernel(
+    x_ptr, out_ptr, scale_ptr,
+    M, K,
+    stride_xm, stride_xk,
+    stride_outm, stride_outk,
+    stride_sm, stride_sg,
+    GROUP_SIZE: tl.constexpr,
+    GROUPS_PER_BLOCK: tl.constexpr,
+    MIDMAX: tl.constexpr = False,
+    MIDMAX_VAL: tl.constexpr = 464.0,
+    SR_SEED: tl.constexpr = 0.5,
+):
+    pid_m = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    BLOCK_SIZE: tl.constexpr = GROUP_SIZE * GROUPS_PER_BLOCK
+
+    block_start = pid_g * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+
+    x_bf16 = tl.load(x_ptr + pid_m * stride_xm + offsets * stride_xk,
+                      mask=offsets < K, other=0.0)
+
+    x_grouped = tl.reshape(x_bf16, (GROUPS_PER_BLOCK, GROUP_SIZE))
+    scale_exp = _get_exponent_midmax_bf16(x_grouped, 8, MIDMAX_VAL) if MIDMAX else _get_exponent_bf16(x_grouped, 8)
+
+    group_indices = tl.arange(0, GROUPS_PER_BLOCK)
+    g_abs = pid_g * GROUPS_PER_BLOCK + group_indices
+    tl.store(scale_ptr + pid_m * stride_sm + g_abs * stride_sg,
+             scale_exp.to(tl.uint8),
+             mask=g_abs < (K // GROUP_SIZE))
+
+    scale_exp_broad = tl.broadcast_to(
+        tl.reshape(scale_exp, (GROUPS_PER_BLOCK, 1)),
+        (GROUPS_PER_BLOCK, GROUP_SIZE),
+    )
+    scale_f32 = (tl.reshape(scale_exp_broad, (BLOCK_SIZE,)).to(tl.uint32) << 23)
+
+    fp8 = tl.inline_asm_elementwise(
+        "v_cvt_scalef32_sr_fp8_bf16 $0, $1, $2, $3",
+        "=v,v,v,v",
+        args=[x_bf16, SR_SEED, scale_f32],
+        dtype=tl.uint16, is_pure=True, pack=1,
+    )
+    fp8 = fp8.to(tl.uint8)
+    fp8 = tl.where((fp8 & 0x7F) == 0x7F, fp8 - 1, fp8)
+
+    tl.store(out_ptr + pid_m * stride_outm + offsets * stride_outk,
+             fp8, mask=offsets < K)
+
+
+# ---------------------------------------------------------------------------
+# MXFP8 E5M2 – SR from FP16 via v_cvt_scalef32_sr_bf8_f16
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _f16_to_mxfp8e5_sr_kernel(
+    x_ptr, out_ptr, scale_ptr,
+    M, K,
+    stride_xm, stride_xk,
+    stride_outm, stride_outk,
+    stride_sm, stride_sg,
+    GROUP_SIZE: tl.constexpr,
+    GROUPS_PER_BLOCK: tl.constexpr,
+    MIDMAX: tl.constexpr = False,
+    MIDMAX_VAL: tl.constexpr = 61440.0,
+    SR_SEED: tl.constexpr = 0.5,
+):
+    pid_m = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    BLOCK_SIZE: tl.constexpr = GROUP_SIZE * GROUPS_PER_BLOCK
+
+    block_start = pid_g * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+
+    x_f16 = tl.load(x_ptr + pid_m * stride_xm + offsets * stride_xk,
+                     mask=offsets < K, other=0.0)
+
+    x_grouped = tl.reshape(x_f16, (GROUPS_PER_BLOCK, GROUP_SIZE))
+    scale_exp = _get_exponent_midmax_f16(x_grouped, 15, MIDMAX_VAL) if MIDMAX else _get_exponent_f16(x_grouped, 15)
+
+    group_indices = tl.arange(0, GROUPS_PER_BLOCK)
+    g_abs = pid_g * GROUPS_PER_BLOCK + group_indices
+    tl.store(scale_ptr + pid_m * stride_sm + g_abs * stride_sg,
+             scale_exp.to(tl.uint8),
+             mask=g_abs < (K // GROUP_SIZE))
+
+    scale_exp_broad = tl.broadcast_to(
+        tl.reshape(scale_exp, (GROUPS_PER_BLOCK, 1)),
+        (GROUPS_PER_BLOCK, GROUP_SIZE),
+    )
+    scale_f32 = (tl.reshape(scale_exp_broad, (BLOCK_SIZE,)).to(tl.uint32) << 23)
+
+    fp8 = tl.inline_asm_elementwise(
+        "v_cvt_scalef32_sr_bf8_f16 $0, $1, $2, $3",
+        "=v,v,v,v",
+        args=[x_f16, SR_SEED, scale_f32],
+        dtype=tl.uint16, is_pure=True, pack=1,
+    )
+    fp8 = fp8.to(tl.uint8)
+    fp8 = tl.where((fp8 >= 0x7C) & (fp8 < 0x80), 0x7B, fp8)
+    fp8 = tl.where(fp8 >= 0xFC, 0xFB, fp8)
+
+    tl.store(out_ptr + pid_m * stride_outm + offsets * stride_outk,
+             fp8, mask=offsets < K)
+
+
+# ---------------------------------------------------------------------------
+# MXFP8 E5M2 – SR from BF16 via v_cvt_scalef32_sr_bf8_bf16
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _bf16_to_mxfp8e5_sr_kernel(
+    x_ptr, out_ptr, scale_ptr,
+    M, K,
+    stride_xm, stride_xk,
+    stride_outm, stride_outk,
+    stride_sm, stride_sg,
+    GROUP_SIZE: tl.constexpr,
+    GROUPS_PER_BLOCK: tl.constexpr,
+    MIDMAX: tl.constexpr = False,
+    MIDMAX_VAL: tl.constexpr = 61440.0,
+    SR_SEED: tl.constexpr = 0.5,
+):
+    pid_m = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    BLOCK_SIZE: tl.constexpr = GROUP_SIZE * GROUPS_PER_BLOCK
+
+    block_start = pid_g * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+
+    x_bf16 = tl.load(x_ptr + pid_m * stride_xm + offsets * stride_xk,
+                      mask=offsets < K, other=0.0)
+
+    x_grouped = tl.reshape(x_bf16, (GROUPS_PER_BLOCK, GROUP_SIZE))
+    scale_exp = _get_exponent_midmax_bf16(x_grouped, 15, MIDMAX_VAL) if MIDMAX else _get_exponent_bf16(x_grouped, 15)
+
+    group_indices = tl.arange(0, GROUPS_PER_BLOCK)
+    g_abs = pid_g * GROUPS_PER_BLOCK + group_indices
+    tl.store(scale_ptr + pid_m * stride_sm + g_abs * stride_sg,
+             scale_exp.to(tl.uint8),
+             mask=g_abs < (K // GROUP_SIZE))
+
+    scale_exp_broad = tl.broadcast_to(
+        tl.reshape(scale_exp, (GROUPS_PER_BLOCK, 1)),
+        (GROUPS_PER_BLOCK, GROUP_SIZE),
+    )
+    scale_f32 = (tl.reshape(scale_exp_broad, (BLOCK_SIZE,)).to(tl.uint32) << 23)
+
+    fp8 = tl.inline_asm_elementwise(
+        "v_cvt_scalef32_sr_bf8_bf16 $0, $1, $2, $3",
+        "=v,v,v,v",
+        args=[x_bf16, SR_SEED, scale_f32],
+        dtype=tl.uint16, is_pure=True, pack=1,
+    )
+    fp8 = fp8.to(tl.uint8)
+    fp8 = tl.where((fp8 >= 0x7C) & (fp8 < 0x80), 0x7B, fp8)
+    fp8 = tl.where(fp8 >= 0xFC, 0xFB, fp8)
+
+    tl.store(out_ptr + pid_m * stride_outm + offsets * stride_outk,
+             fp8, mask=offsets < K)
+
+
+# ---------------------------------------------------------------------------
 # Public Python wrappers
 # ---------------------------------------------------------------------------
 
@@ -1105,6 +1335,110 @@ def quantize_mxfp8e5_rtne_from_bf16(
     return out.view(torch.float8_e5m2), scales
 
 
+def quantize_mxfp8e4_sr_from_f16(
+    x: torch.Tensor,
+    group_size: int = 32,
+    groups_per_block: int = 256,
+    num_warps: int = 4,
+    midmax: bool = False,
+    sr_seed: float = 0.5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FP16 → MXFP8 E4M3 (stochastic rounding) via v_cvt_scalef32_sr_fp8_f16."""
+    assert x.dtype == torch.float16, f"expected float16 input, got {x.dtype}"
+    M, K = _check_shape(x, group_size)
+    n_groups = K // group_size
+    out = torch.empty((M, K), dtype=torch.uint8, device=x.device)
+    scales = torch.empty((M, n_groups), dtype=torch.uint8, device=x.device)
+    grid = (M, n_groups // groups_per_block)
+    _f16_to_mxfp8e4_sr_kernel[grid](
+        x, out, scales, M, K,
+        x.stride(0), x.stride(1),
+        out.stride(0), out.stride(1),
+        scales.stride(0), scales.stride(1),
+        GROUP_SIZE=group_size, GROUPS_PER_BLOCK=groups_per_block,
+        MIDMAX=midmax, SR_SEED=sr_seed, num_warps=num_warps,
+    )
+    return out.view(torch.float8_e4m3fn), scales
+
+
+def quantize_mxfp8e4_sr_from_bf16(
+    x: torch.Tensor,
+    group_size: int = 32,
+    groups_per_block: int = 256,
+    num_warps: int = 4,
+    midmax: bool = False,
+    sr_seed: float = 0.5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """BF16 → MXFP8 E4M3 (stochastic rounding) via v_cvt_scalef32_sr_fp8_bf16."""
+    assert x.dtype == torch.bfloat16, f"expected bfloat16 input, got {x.dtype}"
+    M, K = _check_shape(x, group_size)
+    n_groups = K // group_size
+    out = torch.empty((M, K), dtype=torch.uint8, device=x.device)
+    scales = torch.empty((M, n_groups), dtype=torch.uint8, device=x.device)
+    grid = (M, n_groups // groups_per_block)
+    _bf16_to_mxfp8e4_sr_kernel[grid](
+        x, out, scales, M, K,
+        x.stride(0), x.stride(1),
+        out.stride(0), out.stride(1),
+        scales.stride(0), scales.stride(1),
+        GROUP_SIZE=group_size, GROUPS_PER_BLOCK=groups_per_block,
+        MIDMAX=midmax, SR_SEED=sr_seed, num_warps=num_warps,
+    )
+    return out.view(torch.float8_e4m3fn), scales
+
+
+def quantize_mxfp8e5_sr_from_f16(
+    x: torch.Tensor,
+    group_size: int = 32,
+    groups_per_block: int = 256,
+    num_warps: int = 4,
+    midmax: bool = False,
+    sr_seed: float = 0.5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FP16 → MXFP8 E5M2 (stochastic rounding) via v_cvt_scalef32_sr_bf8_f16."""
+    assert x.dtype == torch.float16, f"expected float16 input, got {x.dtype}"
+    M, K = _check_shape(x, group_size)
+    n_groups = K // group_size
+    out = torch.empty((M, K), dtype=torch.uint8, device=x.device)
+    scales = torch.empty((M, n_groups), dtype=torch.uint8, device=x.device)
+    grid = (M, n_groups // groups_per_block)
+    _f16_to_mxfp8e5_sr_kernel[grid](
+        x, out, scales, M, K,
+        x.stride(0), x.stride(1),
+        out.stride(0), out.stride(1),
+        scales.stride(0), scales.stride(1),
+        GROUP_SIZE=group_size, GROUPS_PER_BLOCK=groups_per_block,
+        MIDMAX=midmax, SR_SEED=sr_seed, num_warps=num_warps,
+    )
+    return out.view(torch.float8_e5m2), scales
+
+
+def quantize_mxfp8e5_sr_from_bf16(
+    x: torch.Tensor,
+    group_size: int = 32,
+    groups_per_block: int = 256,
+    num_warps: int = 4,
+    midmax: bool = False,
+    sr_seed: float = 0.5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """BF16 → MXFP8 E5M2 (stochastic rounding) via v_cvt_scalef32_sr_bf8_bf16."""
+    assert x.dtype == torch.bfloat16, f"expected bfloat16 input, got {x.dtype}"
+    M, K = _check_shape(x, group_size)
+    n_groups = K // group_size
+    out = torch.empty((M, K), dtype=torch.uint8, device=x.device)
+    scales = torch.empty((M, n_groups), dtype=torch.uint8, device=x.device)
+    grid = (M, n_groups // groups_per_block)
+    _bf16_to_mxfp8e5_sr_kernel[grid](
+        x, out, scales, M, K,
+        x.stride(0), x.stride(1),
+        out.stride(0), out.stride(1),
+        scales.stride(0), scales.stride(1),
+        GROUP_SIZE=group_size, GROUPS_PER_BLOCK=groups_per_block,
+        MIDMAX=midmax, SR_SEED=sr_seed, num_warps=num_warps,
+    )
+    return out.view(torch.float8_e5m2), scales
+
+
 # ---------------------------------------------------------------------------
 # Decode helpers
 # ---------------------------------------------------------------------------
@@ -1266,13 +1600,21 @@ def _run_tests():
 
     f16_configs = [
         ("MXFP8 E4M3  RTNE f16       ", quantize_mxfp8e4_rtne_from_f16,
-         dict(group_size=GROUP_SIZE, groups_per_block=16),              "e4m3", "max",    "even"),
+         dict(group_size=GROUP_SIZE, groups_per_block=16),               "e4m3", "max",    "even"),
         ("MXFP8 E4M3  RTNE f16 midmax", quantize_mxfp8e4_rtne_from_f16,
-         dict(group_size=GROUP_SIZE, groups_per_block=16, midmax=True), "e4m3", "midmax", "even"),
+         dict(group_size=GROUP_SIZE, groups_per_block=16, midmax=True),  "e4m3", "midmax", "even"),
+        ("MXFP8 E4M3  SR   f16       ", quantize_mxfp8e4_sr_from_f16,
+         dict(group_size=GROUP_SIZE, groups_per_block=256),              "e4m3", "max",    "stochastic"),
+        ("MXFP8 E4M3  SR   f16 midmax", quantize_mxfp8e4_sr_from_f16,
+         dict(group_size=GROUP_SIZE, groups_per_block=256, midmax=True), "e4m3", "midmax", "stochastic"),
         ("MXFP8 E5M2  RTNE f16       ", quantize_mxfp8e5_rtne_from_f16,
-         dict(group_size=GROUP_SIZE, groups_per_block=16),              "e5m2", "max",    "even"),
+         dict(group_size=GROUP_SIZE, groups_per_block=16),               "e5m2", "max",    "even"),
         ("MXFP8 E5M2  RTNE f16 midmax", quantize_mxfp8e5_rtne_from_f16,
-         dict(group_size=GROUP_SIZE, groups_per_block=16, midmax=True), "e5m2", "midmax", "even"),
+         dict(group_size=GROUP_SIZE, groups_per_block=16, midmax=True),  "e5m2", "midmax", "even"),
+        ("MXFP8 E5M2  SR   f16       ", quantize_mxfp8e5_sr_from_f16,
+         dict(group_size=GROUP_SIZE, groups_per_block=256),              "e5m2", "max",    "stochastic"),
+        ("MXFP8 E5M2  SR   f16 midmax", quantize_mxfp8e5_sr_from_f16,
+         dict(group_size=GROUP_SIZE, groups_per_block=256, midmax=True), "e5m2", "midmax", "stochastic"),
     ]
 
     for name, fn, kwargs, tc_fmt, tc_scalemode, tc_roundmode in f16_configs:
@@ -1319,13 +1661,21 @@ def _run_tests():
 
     bf16_configs = [
         ("MXFP8 E4M3  RTNE bf16       ", quantize_mxfp8e4_rtne_from_bf16,
-         dict(group_size=GROUP_SIZE, groups_per_block=16),              "e4m3", "max",    "even"),
+         dict(group_size=GROUP_SIZE, groups_per_block=16),               "e4m3", "max",    "even"),
         ("MXFP8 E4M3  RTNE bf16 midmax", quantize_mxfp8e4_rtne_from_bf16,
-         dict(group_size=GROUP_SIZE, groups_per_block=16, midmax=True), "e4m3", "midmax", "even"),
+         dict(group_size=GROUP_SIZE, groups_per_block=16, midmax=True),  "e4m3", "midmax", "even"),
+        ("MXFP8 E4M3  SR   bf16       ", quantize_mxfp8e4_sr_from_bf16,
+         dict(group_size=GROUP_SIZE, groups_per_block=256),              "e4m3", "max",    "stochastic"),
+        ("MXFP8 E4M3  SR   bf16 midmax", quantize_mxfp8e4_sr_from_bf16,
+         dict(group_size=GROUP_SIZE, groups_per_block=256, midmax=True), "e4m3", "midmax", "stochastic"),
         ("MXFP8 E5M2  RTNE bf16       ", quantize_mxfp8e5_rtne_from_bf16,
-         dict(group_size=GROUP_SIZE, groups_per_block=16),              "e5m2", "max",    "even"),
+         dict(group_size=GROUP_SIZE, groups_per_block=16),               "e5m2", "max",    "even"),
         ("MXFP8 E5M2  RTNE bf16 midmax", quantize_mxfp8e5_rtne_from_bf16,
-         dict(group_size=GROUP_SIZE, groups_per_block=16, midmax=True), "e5m2", "midmax", "even"),
+         dict(group_size=GROUP_SIZE, groups_per_block=16, midmax=True),  "e5m2", "midmax", "even"),
+        ("MXFP8 E5M2  SR   bf16       ", quantize_mxfp8e5_sr_from_bf16,
+         dict(group_size=GROUP_SIZE, groups_per_block=256),              "e5m2", "max",    "stochastic"),
+        ("MXFP8 E5M2  SR   bf16 midmax", quantize_mxfp8e5_sr_from_bf16,
+         dict(group_size=GROUP_SIZE, groups_per_block=256, midmax=True), "e5m2", "midmax", "stochastic"),
     ]
 
     for name, fn, kwargs, tc_fmt, tc_scalemode, tc_roundmode in bf16_configs:
