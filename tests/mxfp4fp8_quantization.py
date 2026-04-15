@@ -95,14 +95,13 @@ def _get_exponent_midmax(x, offset, midmax: tl.constexpr):
 def _get_exponent_f16(x, offset):
     """Return E8M0 exponent for each row of x [GROUPS, GROUP_SIZE] (FP16 input).
 
-    Works entirely in uint16 integer space to avoid FP16→FP32 promotion:
-    the sign bit is cleared with & 0x7FFF (abs in IEEE 754 space), and the
-    max of unsigned bit patterns equals the max of the absolute FP16 values.
-    The 5-bit biased FP16 exponent (bias=15) is converted to the E8M0 scale
-    exponent by adding 112 (= 127 − 15, the FP32-to-FP16 bias difference).
+    Computes absmax, casts it back to float16 to guarantee a 16-bit value,
+    then bitcasts to uint16 for exponent extraction.  The 5-bit FP16 biased
+    exponent (bias=15) is converted to the E8M0 scale exponent by adding
+    112 (= 127 − 15, the FP32-to-FP16 bias difference).
     """
-    x_bits = x.to(tl.uint16, bitcast=True)
-    absmax_bits = tl.max(x_bits & 0x7FFF, axis=1)  # uint16 max of |x|
+    absmax = tl.max(tl.abs(x), axis=1).to(tl.float16)
+    absmax_bits = absmax.to(tl.uint16, bitcast=True)
     fp16_exp = (absmax_bits >> 10) & 0x1F           # 5-bit biased FP16 exponent
     exp = fp16_exp.to(tl.int32) + 112 - offset      # bias-correct to E8M0
     exp = tl.maximum(exp, 0)
@@ -119,13 +118,13 @@ def _get_exponent_midmax_f16(x, offset, midmax: tl.constexpr):
     mantissa, normalising absmax into [2^offset, 2^(offset+1)).  If that
     normalised value exceeds midmax the E8M0 exponent is incremented by 1.
     """
-    x_bits = x.to(tl.uint16, bitcast=True)
-    absmax_bits = tl.max(x_bits & 0x7FFF, axis=1)
+    absmax = tl.max(tl.abs(x), axis=1).to(tl.float16)
+    absmax_bits = absmax.to(tl.uint16, bitcast=True)
     fp16_exp = (absmax_bits >> 10) & 0x1F
     exp = fp16_exp.to(tl.int32) + 112 - offset
 
     # Replace FP16 exponent with (15 + offset) to normalise absmax into
-    # [2^offset, 2^(offset+1)) without leaving 16-bit space.
+    # [2^offset, 2^(offset+1)).
     amax_scaled_bits = (absmax_bits & 0x03FF) | ((15 + offset) << 10)
     amax_scaled = amax_scaled_bits.to(tl.float16, bitcast=True)
 
