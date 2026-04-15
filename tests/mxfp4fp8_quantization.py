@@ -39,6 +39,8 @@ __all__ = [
     "quantize_mxfp4_rtne",
     # FP16 input
     "quantize_mxfp8e4_rtne_from_f16",
+    # BF16 input
+    "quantize_mxfp8e4_rtne_from_bf16",
 ]
 
 # ---------------------------------------------------------------------------
@@ -452,6 +454,51 @@ def _f32_to_mxfp4_rtne_kernel(
 
 
 # ---------------------------------------------------------------------------
+# BF16-native exponent helpers (no FP32 upcast)
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _get_exponent_bf16(x, offset):
+    """Return E8M0 exponent for each row of x [GROUPS, GROUP_SIZE] (BF16 input).
+
+    BF16 format: [sign(1)][exp(8)][mantissa(7)].  The 8-bit exponent has the
+    same bias (127) as FP32, so the E8M0 scale exponent is simply bf16_exp - offset,
+    identical to the FP32 formula — no bias correction needed.
+    """
+    absmax = tl.max(tl.abs(x), axis=1).to(tl.bfloat16)
+    absmax_bits = absmax.to(tl.uint16, bitcast=True)
+    bf16_exp = (absmax_bits >> 7) & 0xFF         # 8-bit biased BF16 exponent (bias=127)
+    exp = bf16_exp.to(tl.int32) - offset         # same formula as FP32 _get_exponent
+    exp = tl.maximum(exp, 0)
+    exp = tl.minimum(exp, 255)
+    return exp
+
+
+@triton.jit
+def _get_exponent_midmax_bf16(x, offset, midmax: tl.constexpr):
+    """Return E8M0 exponent for each row of x [GROUPS, GROUP_SIZE] (BF16 input).
+
+    Applies the midmax threshold check in BF16 space: the 8-bit BF16 exponent
+    field (bits 14:7) is replaced with (127 + offset) while the 7-bit mantissa
+    (bits 6:0) is preserved, normalising absmax into [2^offset, 2^(offset+1)).
+    """
+    absmax = tl.max(tl.abs(x), axis=1).to(tl.bfloat16)
+    absmax_bits = absmax.to(tl.uint16, bitcast=True)
+    bf16_exp = (absmax_bits >> 7) & 0xFF
+    exp = bf16_exp.to(tl.int32) - offset
+
+    # Replace BF16 exponent with (127 + offset) to normalise absmax into
+    # [2^offset, 2^(offset+1)) without leaving 16-bit space.
+    amax_scaled_bits = (absmax_bits & 0x007F) | ((127 + offset) << 7)
+    amax_scaled = amax_scaled_bits.to(tl.bfloat16, bitcast=True)
+
+    exp = exp + (amax_scaled.to(tl.float32) > midmax).to(tl.int32)
+    exp = tl.maximum(exp, 0)
+    exp = tl.minimum(exp, 255)
+    return exp
+
+
+# ---------------------------------------------------------------------------
 # MXFP8 E4M3 – RTNE from FP16 via v_cvt_scalef32_pk_fp8_f32
 # ---------------------------------------------------------------------------
 
@@ -469,8 +516,8 @@ def _f16_to_mxfp8e4_rtne_kernel(
 ):
     """
     Convert FP16 → MXFP8 E4M3 with RTNE using v_cvt_scalef32_pk_fp8_f16.
-    FP16 values are upcast to FP32 only for scale (E8M0 exponent) computation;
-    the native FP16 values are passed directly to the conversion instruction.
+    Scale (E8M0 exponent) computation uses _get_exponent_f16 which works
+    directly on FP16 bit patterns with no FP32 upcast.
     """
     pid_m = tl.program_id(0)
     pid_g = tl.program_id(1)
@@ -503,6 +550,74 @@ def _f16_to_mxfp8e4_rtne_kernel(
 
     fp8_packed = tl.inline_asm_elementwise(
         "v_cvt_scalef32_pk_fp8_f16 $0, $1, $2",
+        "=v,v,v",
+        args=[x_pk, scale_f32],
+        dtype=tl.uint16, is_pure=True, pack=1,
+    )
+
+    fp8_0 = (fp8_packed & 0xFF).to(tl.uint8)
+    fp8_1 = ((fp8_packed >> 8) & 0xFF).to(tl.uint8)
+    fp8_0 = tl.where((fp8_0 & 0x7F) == 0x7F, fp8_0 - 1, fp8_0)
+    fp8_1 = tl.where((fp8_1 & 0x7F) == 0x7F, fp8_1 - 1, fp8_1)
+
+    fp8_interleaved = tl.interleave(fp8_0, fp8_1)
+    out_offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    tl.store(out_ptr + pid_m * stride_outm + out_offsets * stride_outk,
+             fp8_interleaved, mask=out_offsets < K)
+
+
+# ---------------------------------------------------------------------------
+# MXFP8 E4M3 – RTNE from BF16 via v_cvt_scalef32_pk_fp8_bf16
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _bf16_to_mxfp8e4_rtne_kernel(
+    x_ptr, out_ptr, scale_ptr,
+    M, K,
+    stride_xm, stride_xk,
+    stride_outm, stride_outk,
+    stride_sm, stride_sg,
+    GROUP_SIZE: tl.constexpr,
+    GROUPS_PER_BLOCK: tl.constexpr,
+    MIDMAX: tl.constexpr = False,
+    MIDMAX_VAL: tl.constexpr = 464.0,
+):
+    """
+    Convert BF16 → MXFP8 E4M3 with RTNE using v_cvt_scalef32_pk_fp8_bf16.
+    Scale (E8M0 exponent) computation uses _get_exponent_bf16 which works
+    directly on BF16 bit patterns with no FP32 upcast.
+    """
+    pid_m = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    BLOCK_SIZE: tl.constexpr = GROUP_SIZE * GROUPS_PER_BLOCK
+
+    block_start = pid_g * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+
+    x_bf16 = tl.load(x_ptr + pid_m * stride_xm + offsets * stride_xk,
+                      mask=offsets < K, other=0.0)
+
+    x_grouped = tl.reshape(x_bf16, (GROUPS_PER_BLOCK, GROUP_SIZE))
+    scale_exp = _get_exponent_midmax_bf16(x_grouped, 8, MIDMAX_VAL) if MIDMAX else _get_exponent_bf16(x_grouped, 8)
+
+    group_indices = tl.arange(0, GROUPS_PER_BLOCK)
+    g_abs = pid_g * GROUPS_PER_BLOCK + group_indices
+    tl.store(scale_ptr + pid_m * stride_sm + g_abs * stride_sg,
+             scale_exp.to(tl.uint8),
+             mask=g_abs < (K // GROUP_SIZE))
+
+    scale_exp_broad = tl.broadcast_to(
+        tl.reshape(scale_exp, (GROUPS_PER_BLOCK, 1)),
+        (GROUPS_PER_BLOCK, GROUP_SIZE // 2),
+    )
+    scale_f32 = (tl.reshape(scale_exp_broad, (BLOCK_SIZE // 2,)).to(tl.uint32) << 23)
+
+    x_lo, x_hi = tl.split(tl.reshape(x_bf16, (BLOCK_SIZE // 2, 2)))
+    x_pk = (x_lo.to(tl.uint16, bitcast=True).to(tl.uint32) | (x_hi.to(tl.uint16, bitcast=True).to(tl.uint32) << 16)).to(tl.float32, bitcast=True)
+
+    fp8_packed = tl.inline_asm_elementwise(
+        "v_cvt_scalef32_pk_fp8_bf16 $0, $1, $2",
         "=v,v,v",
         args=[x_pk, scale_f32],
         dtype=tl.uint16, is_pure=True, pack=1,
@@ -742,6 +857,44 @@ def quantize_mxfp8e4_rtne_from_f16(
     return out.view(torch.float8_e4m3fn), scales
 
 
+def quantize_mxfp8e4_rtne_from_bf16(
+    x: torch.Tensor,
+    group_size: int = 32,
+    groups_per_block: int = 16,
+    num_warps: int = 4,
+    midmax: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    BF16 → MXFP8 E4M3 (round-to-nearest-even).
+
+    Input must be a bfloat16 tensor. Scale (E8M0 exponent) computation works
+    directly on BF16 bit patterns via _get_exponent_bf16 with no FP32 upcast.
+
+    Returns
+    -------
+    fp8   : torch.float8_e4m3fn tensor [M, K]
+    scales: torch.uint8 tensor [M, K // group_size]  (E8M0 exponents)
+    """
+    assert x.dtype == torch.bfloat16, f"expected bfloat16 input, got {x.dtype}"
+    M, K = _check_shape(x, group_size)
+    n_groups = K // group_size
+    out = torch.empty((M, K), dtype=torch.uint8, device=x.device)
+    scales = torch.empty((M, n_groups), dtype=torch.uint8, device=x.device)
+
+    grid = (M, n_groups // groups_per_block)
+    _bf16_to_mxfp8e4_rtne_kernel[grid](
+        x, out, scales, M, K,
+        x.stride(0), x.stride(1),
+        out.stride(0), out.stride(1),
+        scales.stride(0), scales.stride(1),
+        GROUP_SIZE=group_size,
+        GROUPS_PER_BLOCK=groups_per_block,
+        MIDMAX=midmax,
+        num_warps=num_warps,
+    )
+    return out.view(torch.float8_e4m3fn), scales
+
+
 # ---------------------------------------------------------------------------
 # Decode helpers
 # ---------------------------------------------------------------------------
@@ -931,6 +1084,54 @@ def _run_tests():
 
             ms = tt.do_bench(lambda: fn(x_f16, **kwargs), warmup=25, rep=500)
             gbps = x_f16.numel() * 2 / (ms * 1e-3) / 1e9  # 2 bytes per FP16 element
+
+            print(f"  {name}: L_inf={l_inf_fp32:.4f}  time={ms:.4f} ms  read_bw={gbps:.1f} GB/s{tc_suffix}")
+
+        except Exception as e:
+            import traceback
+            print(f"  {name}: FAILED — {e}")
+            traceback.print_exc()
+
+    print()
+
+    # -----------------------------------------------------------------------
+    # BF16 input tests
+    # -----------------------------------------------------------------------
+    print("--- BF16 → MXFP8 E4M3 ---\n")
+
+    x_bf16 = x.to(torch.bfloat16)
+    x_bf16_f32 = x_bf16.float()  # reference for round-trip error (BF16 precision)
+
+    bf16_configs = [
+        ("MXFP8 E4M3  RTNE bf16       ", quantize_mxfp8e4_rtne_from_bf16,
+         dict(group_size=GROUP_SIZE, groups_per_block=16),              "e4m3", "max",    "even"),
+        ("MXFP8 E4M3  RTNE bf16 midmax", quantize_mxfp8e4_rtne_from_bf16,
+         dict(group_size=GROUP_SIZE, groups_per_block=16, midmax=True), "e4m3", "midmax", "even"),
+    ]
+
+    for name, fn, kwargs, tc_fmt, tc_scalemode, tc_roundmode in bf16_configs:
+        try:
+            q, s = fn(x_bf16, **kwargs)
+            assert q.dtype == torch.float8_e4m3fn, f"wrong dtype {q.dtype}"
+            assert q.shape == (M, K)
+            assert s.shape == (M, K // GROUP_SIZE)
+            assert s.dtype == torch.uint8
+
+            s_f32 = (2.0 ** (s.float() - 127)).repeat_interleave(GROUP_SIZE, dim=1)
+            x_recon = q.float() * s_f32
+            l_inf_fp32 = torch.max(torch.abs(x_recon - x_bf16_f32)).item()
+
+            tc_suffix = ""
+            if _tcast_available:
+                tc_q, tc_scale, tc_s_broad = _tcast_quantize(
+                    x_bf16_f32, tc_fmt, scalemode=tc_scalemode, roundmode=tc_roundmode)
+                l_inf_scale = torch.max(torch.abs(s.float() - tc_scale.float())).item()
+                tc_recon = tc_q.float() * tc_s_broad
+                l_inf_vs_tc = torch.max(torch.abs(x_recon - tc_recon)).item()
+                tc_suffix = f"  vs_tcast(L_inf scale={l_inf_scale:.1f}, L_inf val={l_inf_vs_tc:.4f})"
+
+            ms = tt.do_bench(lambda: fn(x_bf16, **kwargs), warmup=25, rep=500)
+            gbps = x_bf16.numel() * 2 / (ms * 1e-3) / 1e9  # 2 bytes per BF16 element
 
             print(f"  {name}: L_inf={l_inf_fp32:.4f}  time={ms:.4f} ms  read_bw={gbps:.1f} GB/s{tc_suffix}")
 
