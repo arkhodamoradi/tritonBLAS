@@ -1278,7 +1278,8 @@ def _run_tests():
     for name, fn, kwargs, tc_fmt, tc_scalemode, tc_roundmode in f16_configs:
         try:
             q, s = fn(x_f16, **kwargs)
-            assert q.dtype == torch.float8_e4m3fn, f"wrong dtype {q.dtype}"
+            expected_dtype = torch.float8_e5m2 if "E5M2" in name else torch.float8_e4m3fn
+            assert q.dtype == expected_dtype, f"wrong dtype {q.dtype}"
             assert q.shape == (M, K)
             assert s.shape == (M, K // GROUP_SIZE)
             assert s.dtype == torch.uint8
@@ -1330,7 +1331,8 @@ def _run_tests():
     for name, fn, kwargs, tc_fmt, tc_scalemode, tc_roundmode in bf16_configs:
         try:
             q, s = fn(x_bf16, **kwargs)
-            assert q.dtype == torch.float8_e4m3fn, f"wrong dtype {q.dtype}"
+            expected_dtype = torch.float8_e5m2 if "E5M2" in name else torch.float8_e4m3fn
+            assert q.dtype == expected_dtype, f"wrong dtype {q.dtype}"
             assert q.shape == (M, K)
             assert s.shape == (M, K // GROUP_SIZE)
             assert s.dtype == torch.uint8
