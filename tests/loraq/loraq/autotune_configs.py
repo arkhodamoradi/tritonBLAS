@@ -140,6 +140,7 @@ class AutotunedLoRaQ:
 
     def _make_launch_fn(self, cfg, a_fp8, a_scale, r_fp8, r_scale,
                         l_fp8, l_scale, w_fp4_t, w_scale, bias_ptr,
+                        channel_scale,
                         c_fp8, c_scale, M, N, K, has_bias):
         """Create a lambda that launches the kernel with the given config."""
         bm = cfg.kwargs["BLOCK_M"]
@@ -158,6 +159,7 @@ class AutotunedLoRaQ:
                 l_fp8, l_scale,
                 w_fp4_t, w_scale,
                 bias_ptr,
+                channel_scale,
                 c_fp8, c_scale,
                 M, N, K,
                 a_fp8.stride(0), a_fp8.stride(1),
@@ -170,6 +172,7 @@ class AutotunedLoRaQ:
                 w_scale.stride(0), w_scale.stride(1),
                 c_fp8.stride(0), c_fp8.stride(1),
                 c_scale.stride(0), c_scale.stride(1),
+                channel_scale.stride(0),
                 HAS_BIAS=has_bias,
                 RANK=self.rank,
                 BLOCK_M=bm,
@@ -182,7 +185,7 @@ class AutotunedLoRaQ:
         return launch
 
     def _tune(self, a_fp8, a_scale, r_fp8, r_scale, l_fp8, l_scale,
-              w_fp4_t, w_scale, M, N, K, bias, has_bias):
+              w_fp4_t, w_scale, M, N, K, bias, has_bias, channel_scale):
         """Run all configs and pick the fastest."""
         bias_ptr = bias if has_bias else a_fp8
 
@@ -205,7 +208,7 @@ class AutotunedLoRaQ:
                 fn = self._make_launch_fn(
                     cfg, a_fp8, a_scale, r_fp8, r_scale,
                     l_fp8, l_scale, w_fp4_t, w_scale,
-                    bias_ptr, c_fp8, c_scale, M, N, K, has_bias,
+                    bias_ptr, channel_scale, c_fp8, c_scale, M, N, K, has_bias,
                 )
                 ms = tt.do_bench(fn, warmup=self.warmup, rep=self.rep)
                 if ms < best_ms:
@@ -227,7 +230,7 @@ class AutotunedLoRaQ:
         }
 
     def __call__(self, a_fp8, a_scale, r_fp8, r_scale, l_fp8, l_scale,
-                 w_fp4_t, w_scale, M, N, K, bias=None):
+                 w_fp4_t, w_scale, M, N, K, bias=None, channel_scale=None):
         """
         Launch the kernel with the best config for (M, N, K).
         First call for a given (M,N,K) triggers autotuning.
@@ -241,11 +244,15 @@ class AutotunedLoRaQ:
         has_bias = bias is not None
         bias_ptr = bias if has_bias else a_fp8
 
+        # Default channel_scale to ones if not provided
+        if channel_scale is None:
+            channel_scale = torch.ones(N, dtype=torch.float16, device=a_fp8.device)
+
         if key not in self._cache:
             self._cache[key] = self._tune(
                 a_fp8, a_scale, r_fp8, r_scale,
                 l_fp8, l_scale, w_fp4_t, w_scale,
-                M, N, K, bias, has_bias,
+                M, N, K, bias, has_bias, channel_scale,
             )
 
         cfg = self._cache[key]["config"]
@@ -265,6 +272,7 @@ class AutotunedLoRaQ:
             l_fp8, l_scale,
             w_fp4_t, w_scale,
             bias_ptr,
+            channel_scale,
             c_fp8, c_scale,
             M, N, K,
             a_fp8.stride(0), a_fp8.stride(1),
@@ -277,6 +285,7 @@ class AutotunedLoRaQ:
             w_scale.stride(0), w_scale.stride(1),
             c_fp8.stride(0), c_fp8.stride(1),
             c_scale.stride(0), c_scale.stride(1),
+            channel_scale.stride(0),
             HAS_BIAS=has_bias,
             RANK=self.rank,
             BLOCK_M=bm,

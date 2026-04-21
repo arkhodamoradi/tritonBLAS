@@ -18,14 +18,14 @@ import torch
 import triton
 import triton.testing as tt
 
-from fast_loraq.linear import (
+from loraq.linear import (
     TritonLinearLoRaQ,
     TritonLinearLoRaQFP8,
     TritonLinearFP4,
     triton_loraq_fused_q8,
     triton_loraq_fused_q8_scaled,
 )
-from fast_loraq.quant import dynamic_mxfp4_quant, dynamic_mxfp8_quant, mxfp8_to_f32
+from loraq.quant import dynamic_mxfp4_quant, dynamic_mxfp8_quant, mxfp8_to_f32
 
 
 # ---------------------------------------------------------------------------

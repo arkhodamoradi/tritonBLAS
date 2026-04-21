@@ -491,6 +491,7 @@ class TritonLinearFP4(nn.Module):
 def triton_loraq_project_and_quant(
     A: torch.Tensor,
     R: torch.Tensor,
+    channel_scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Fused projection + MXFP4 quantization in a single pass over A.
@@ -499,6 +500,7 @@ def triton_loraq_project_and_quant(
     ----------
     A : (M, K) fp16 activation tensor
     R : (rank, K) fp16 low-rank factor
+    channel_scale : (K,) fp16/bf16 — per-column scale applied before quant
 
     Returns
     -------
@@ -522,13 +524,14 @@ def triton_loraq_project_and_quant(
     grid = (triton.cdiv(M, BLOCK_M),)
 
     loraq_project_and_quant_kernel[grid](
-        A, R, P, A_fp4, A_scale,
+        A, R, channel_scale, P, A_fp4, A_scale,
         M, K,
         A.stride(0), A.stride(1),
         R.stride(0), R.stride(1),
         P.stride(0), P.stride(1),
         A_fp4.stride(0), A_fp4.stride(1),
         A_scale.stride(0), A_scale.stride(1),
+        channel_scale.stride(0),
         RANK=rank,
         BLOCK_M=BLOCK_M,
         QUANT_GROUP=QUANT_GROUP,
@@ -673,6 +676,12 @@ class TritonLinearLoRA(nn.Module):
             torch.zeros(rank, in_features, device=device, dtype=torch.float16),
         )
 
+        # Channel-wise quantization scale for activation (applied before MXFP4 quant)
+        self.register_buffer(
+            "channel_scale",
+            torch.ones(in_features, device=device, dtype=torch.float16),
+        )
+
         if bias:
             self.register_buffer(
                 "bias",
@@ -786,7 +795,9 @@ class TritonLinearLoRA(nn.Module):
         N = self.out_features
 
         # Kernel 1: fused projection + quantization
-        P, a_fp4, a_scale = triton_loraq_project_and_quant(x_2d, self.R)
+        P, a_fp4, a_scale = triton_loraq_project_and_quant(
+            x_2d, self.R, self.channel_scale,
+        )
 
         # Weight transpose for kernel 2
         w_fp4_t = self.weight_fp4.t().contiguous()  # (K//2, N)
@@ -833,13 +844,16 @@ def triton_loraq_fused_q8(
     N: int,
     K: int,
     bias: torch.Tensor | None = None,
+    channel_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Fused LoRaQ kernel:
 
         C_fp8 = MXFP8_quant(
-            fp16(q8(A) @ q8(R)^T) @ dequant_fp16(q8(L))^T
-            + q8(A) @ q4(W)^T  [+ bias]
+            channel_scale * (
+                fp16(q8(A) @ q8(R)^T) @ dequant_fp16(q8(L))^T
+                + q8(A) @ q4(W)^T  [+ bias]
+            )
         )
 
     Parameters
@@ -854,6 +868,7 @@ def triton_loraq_fused_q8(
     W_scale : (N, K//32) uint8       – e8m0 block scales for W
     M, N, K : logical dimensions
     bias    : (N,) float32 or None
+    channel_scale : (N,) fp16/bf16 or None — per-column scale before output quant
 
     Returns
     -------
@@ -861,6 +876,10 @@ def triton_loraq_fused_q8(
     C_scale : (M, N//32) uint8
     """
     rank = R_fp8.shape[0]
+
+    # Default channel_scale to ones if not provided
+    if channel_scale is None:
+        channel_scale = torch.ones(N, dtype=torch.float16, device=A_fp8.device)
 
     C_fp8 = torch.empty((M, N), dtype=torch.uint8, device=A_fp8.device)
     C_scale = torch.empty((M, N // 32), dtype=torch.uint8, device=A_fp8.device)
@@ -882,6 +901,7 @@ def triton_loraq_fused_q8(
         L_fp8, L_scale,
         W_fp4, W_scale,
         bias_ptr,
+        channel_scale,
         C_fp8, C_scale,
         M, N, K,
         # A_fp8 strides
@@ -904,6 +924,8 @@ def triton_loraq_fused_q8(
         C_fp8.stride(0), C_fp8.stride(1),
         # C_scale strides
         C_scale.stride(0), C_scale.stride(1),
+        # channel_scale stride
+        channel_scale.stride(0),
         # constexpr
         HAS_BIAS=has_bias,
         RANK=rank,
@@ -1019,6 +1041,12 @@ class TritonLinearLoRaQ(nn.Module):
                 out_features, rank // 32,
                 dtype=torch.uint8, device=device,
             ),
+        )
+
+        # ----- Channel-wise quantization scale (applied before output quant) -----
+        self.register_buffer(
+            "channel_scale",
+            torch.ones(out_features, device=device, dtype=torch.float16),
         )
 
         # ----- Optional bias (fp32, applied before output quant) -----
@@ -1159,6 +1187,7 @@ class TritonLinearLoRaQ(nn.Module):
             w_fp4_t, self.weight_scale,
             M, N, K,
             bias=self.bias,
+            channel_scale=self.channel_scale,
         )
 
         out_shape = (*orig_shape[:-1], self.out_features)
@@ -1193,19 +1222,26 @@ def triton_loraq_fused_q8_scaled(
     N: int,
     K: int,
     bias: torch.Tensor | None = None,
+    channel_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Fused LoRaQ kernel (fully-fp8 Phase 2 variant):
 
         C_fp8 = MXFP8_quant(
-            q8(q8(A) @ q8(R)^T) @ q8(L)^T
-            + q8(A) @ q4(W)^T  [+ bias]
+            channel_scale * (
+                q8(q8(A) @ q8(R)^T) @ q8(L)^T
+                + q8(A) @ q4(W)^T  [+ bias]
+            )
         )
 
     Same interface as ``triton_loraq_fused_q8`` but Phase 2 quantizes P
     to MXFP8 in-register and uses ``dot_scaled("e4m3","e4m3")``.
     """
     rank = R_fp8.shape[0]
+
+    # Default channel_scale to ones if not provided
+    if channel_scale is None:
+        channel_scale = torch.ones(N, dtype=torch.float16, device=A_fp8.device)
 
     C_fp8 = torch.empty((M, N), dtype=torch.uint8, device=A_fp8.device)
     C_scale = torch.empty((M, N // 32), dtype=torch.uint8, device=A_fp8.device)
@@ -1226,6 +1262,7 @@ def triton_loraq_fused_q8_scaled(
         L_fp8, L_scale,
         W_fp4, W_scale,
         bias_ptr,
+        channel_scale,
         C_fp8, C_scale,
         M, N, K,
         A_fp8.stride(0), A_fp8.stride(1),
@@ -1238,6 +1275,7 @@ def triton_loraq_fused_q8_scaled(
         W_scale.stride(0), W_scale.stride(1),
         C_fp8.stride(0), C_fp8.stride(1),
         C_scale.stride(0), C_scale.stride(1),
+        channel_scale.stride(0),
         HAS_BIAS=has_bias,
         RANK=rank,
         BLOCK_M=BLOCK_M,
@@ -1293,6 +1331,7 @@ class TritonLinearLoRaQFP8(TritonLinearLoRaQ):
             w_fp4_t, self.weight_scale,
             M, N, K,
             bias=self.bias,
+            channel_scale=self.channel_scale,
         )
 
         out_shape = (*orig_shape[:-1], self.out_features)

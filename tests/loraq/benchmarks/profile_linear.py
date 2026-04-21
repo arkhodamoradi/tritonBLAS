@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import triton.testing as tt
 
-from fast_loraq.linear import TritonLinear, triton_matmul_nt
+from loraq.linear import TritonLinear, triton_matmul_nt
 
 
 # ---------------------------------------------------------------------------

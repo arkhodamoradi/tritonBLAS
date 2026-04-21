@@ -27,14 +27,16 @@ from loraq.kernels import loraq_fused_q8_kernel, loraq_fused_q8_scaled_kernel
 
 SIZES = [
     # (M,     K,     N)      -- representative workloads
-    (1,     4096,  4096),    # single-token decode
-    (8,     4096,  4096),    # small batch decode
-    (32,    4096,  4096),
-    (64,    4096,  4096),
-    (128,   4096,  4096),
-    (256,   4096,  4096),
+    #(1,     4096,  4096),    # single-token decode
+    #(8,     4096,  4096),    # small batch decode
+    #(32,    4096,  4096),
+    #(64,    4096,  4096),
+    #(128,   4096,  4096),
+    #(256,   4096,  4096),
     (512,   4096,  4096),
     (1024,  4096,  4096),
+    (2048,  4096,  4096),
+    (4096,  4096,  4096),
     (128,   4096,  11008),   # LLaMA-7B FFN up
     (128,   11008, 4096),    # LLaMA-7B FFN down
     (128,   5120,  5120),    # LLaMA-13B hidden
@@ -42,6 +44,7 @@ SIZES = [
     (256,   4096,  14336),   # LLaMA-2 70B FFN up
     (1024,  4096,  14336),
     (2048,  4096,  4096),    # large batch
+    (4096,  4096,  4096),    # large batch
 ]
 
 WARMUP = 25
@@ -106,10 +109,20 @@ def bench_fp(sizes, dtypes):
         for dtype in dtypes:
             x = torch.randn(M, K, device="cuda", dtype=dtype)
 
-            tl = TritonLinear(K, N, bias=False, dtype=dtype)
-            t_triton = benchmark_fn(lambda: tl(x))
-
+            # Create reference first, then copy its weight into Triton layer
+            # so both operate on real (non-zero) data for a fair comparison.
             tl_torch = nn.Linear(K, N, bias=False, device="cuda", dtype=dtype)
+
+            tl = TritonLinear(K, N, bias=False, dtype=dtype)
+            tl.weight.copy_(tl_torch.weight)
+
+            # Correctness check
+            with torch.no_grad():
+                out_triton = tl(x)
+                out_torch = tl_torch(x)
+            max_err = (out_triton - out_torch).abs().max().item()
+
+            t_triton = benchmark_fn(lambda: tl(x))
             t_torch = benchmark_fn(lambda: tl_torch(x))
 
             tf_triton = tflops(M, N, K, t_triton)
@@ -117,11 +130,12 @@ def bench_fp(sizes, dtypes):
             speedup = tf_triton / tf_torch if tf_torch > 0 else float("inf")
 
             label = "fp16" if dtype == torch.float16 else "bf16"
+            err_flag = " ⚠" if max_err > 1e-1 else ""
             print(
                 f"{M:>6} {K:>6} {N:>6} {label:>7}  "
                 f"{us(t_triton):>9.1f}µ {tf_triton:>13.2f}  "
                 f"{us(t_torch):>9.1f}µ {tf_torch:>12.2f}  "
-                f"{speedup:>7.2f}x"
+                f"{speedup:>7.2f}x  err={max_err:.2e}{err_flag}"
             )
             rows.append({
                 "M": M, "K": K, "N": N, "dtype": label,

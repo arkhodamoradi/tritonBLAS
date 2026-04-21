@@ -21,8 +21,8 @@ import torch.nn as nn
 import triton
 import triton.testing as tt
 
-from fast_loraq.kernels import loraq_fused_q8_kernel, loraq_fused_q8_scaled_kernel
-from fast_loraq.quant import dynamic_mxfp4_quant, dynamic_mxfp8_quant
+from loraq.kernels import loraq_fused_q8_kernel, loraq_fused_q8_scaled_kernel
+from loraq.quant import dynamic_mxfp4_quant, dynamic_mxfp8_quant
 
 
 # ---------------------------------------------------------------------------
@@ -132,11 +132,14 @@ def prepare_inputs(M, K, N, device="cuda"):
     # Transpose W for kernel
     w_fp4_t = w_fp4.t().contiguous()
 
-    return a_fp8, a_scale, r_fp8, r_scale, l_fp8, l_scale, w_fp4_t, w_scale
+    # Channel-wise quantization scale (ones = no-op, for benchmarking)
+    channel_scale = torch.ones(N, dtype=torch.float16, device=device)
+
+    return a_fp8, a_scale, r_fp8, r_scale, l_fp8, l_scale, w_fp4_t, w_scale, channel_scale
 
 
 def try_config(kernel_fn, a_fp8, a_scale, r_fp8, r_scale, l_fp8, l_scale,
-               w_fp4_t, w_scale, M, N, K,
+               w_fp4_t, w_scale, channel_scale, M, N, K,
                block_m, block_n, block_k, group_m, num_warps, num_stages):
     """
     Try a single kernel config and return median time in ms, or None if
@@ -168,6 +171,7 @@ def try_config(kernel_fn, a_fp8, a_scale, r_fp8, r_scale, l_fp8, l_scale,
                 l_fp8, l_scale,
                 w_fp4_t, w_scale,
                 bias_ptr,
+                channel_scale,
                 c_fp8, c_scale,
                 M, N, K,
                 a_fp8.stride(0), a_fp8.stride(1),
@@ -180,6 +184,7 @@ def try_config(kernel_fn, a_fp8, a_scale, r_fp8, r_scale, l_fp8, l_scale,
                 w_scale.stride(0), w_scale.stride(1),
                 c_fp8.stride(0), c_fp8.stride(1),
                 c_scale.stride(0), c_scale.stride(1),
+                channel_scale.stride(0),
                 HAS_BIAS=False,
                 RANK=RANK,
                 BLOCK_M=block_m,
