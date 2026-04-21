@@ -1,0 +1,8 @@
+
+=======================================================================================================================================
+  V1 (LoRaQ, rank=64, MXFP8, 1 kernel)  vs  LoRA+Q (rank=32, fp16, 2 kernels)
+  NOTE: V1 input is pre-quantized MXFP8 — online quant cost excluded by design.
+        LoRA+Q input is raw fp16.  Both store W as MXFP4 (quantized from same nn.Linear).
+=======================================================================================================================================
+     M      K      N   LoRA+Q µs  LoRA+Q TFLOPS     V1 µs  V1 TFLOPS   V1/LoRA+Q    FP4 µs   fp16 µs   Rank(LQ)  Rank(V1)
+---------------------------------------------------------------------------------------------------------------------------------------

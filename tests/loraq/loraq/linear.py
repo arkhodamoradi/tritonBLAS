@@ -886,7 +886,7 @@ def triton_loraq_fused_q8(
 
     BLOCK_M = 128
     BLOCK_N = 128
-    BLOCK_K = 64
+    BLOCK_K = 128
     GROUP_SIZE_M = 8
 
     grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
