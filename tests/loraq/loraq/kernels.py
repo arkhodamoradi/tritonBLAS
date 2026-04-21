@@ -84,7 +84,7 @@ def matmul_kernel(
             a = tl.load(a_ptrs, mask=m_mask[:, None] & (k_offs[None, :] < K), other=0.0)
             b = tl.load(b_ptrs, mask=(k_offs[:, None] < K) & n_mask[None, :], other=0.0)
 
-        acc += tl.dot(a, b)
+        tl.dot(a, b, acc=acc, out_dtype=tl.float32)
 
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
@@ -188,7 +188,7 @@ def matmul_fp4_kernel(
         b = tl.load(B_BASE, mask=rk[:, None] < k_remaining, other=0)
 
         # Fused dequant + dot product (hardware-accelerated on MI350)
-        acc += tl.dot_scaled(a, a_scales, "e2m1", b, b_scales, "e2m1")
+        tl.dot_scaled(a, a_scales, "e2m1", b, b_scales, "e2m1", acc=acc, out_dtype=tl.float32)
 
         # Advance pointers along K
         A_BASE += (BLOCK_K // 2) * stride_ak
@@ -487,7 +487,7 @@ def loraq_project_and_quant_kernel(
         # r_tile is (RANK, 32),  we need (32, RANK) for the dot  a_tile @ r_tile^T
         # tl.dot expects (BLOCK_M, 32) @ (32, RANK) -> (BLOCK_M, RANK)
         r_tile_t = tl.trans(r_tile)                      # (32, RANK)
-        acc_p += tl.dot(a_tile.to(tl.float16), r_tile_t)
+        tl.dot(a_tile.to(tl.float16), r_tile_t, acc=acc_p, out_dtype=tl.float32)
 
         # ===== MXFP4 quantisation of this 32-element group ==================
 
@@ -663,7 +663,7 @@ def loraq_dual_gemm_kernel(
         a_data = tl.load(A_BASE, mask=rk[None, :] < k_remaining, other=0)
         w_data = tl.load(W_BASE, mask=rk[:, None] < k_remaining, other=0)
 
-        acc_q += tl.dot_scaled(a_data, a_scales, "e2m1", w_data, w_scales, "e2m1")
+        acc_q = tl.dot_scaled(a_data, a_scales, "e2m1", w_data, w_scales, "e2m1", acc=acc_q, out_dtype=tl.float32)
 
         A_BASE += (BLOCK_K // 2) * stride_afk
         W_BASE += (BLOCK_K // 2) * stride_wfk
@@ -817,8 +817,9 @@ def loraq_fused_q8_kernel(
             other=0,
         )
 
-        acc_p += tl.dot_scaled(a_tile, a_scale, "e4m3",
-                               r_tile, r_scale, "e4m3")
+        acc_p = tl.dot_scaled(a_tile, a_scale, "e4m3",
+                               r_tile, r_scale, "e4m3",
+                               acc=acc_p, out_dtype=tl.float32)
 
         # ---- A × W^T:  dot_scaled("e4m3", "e2m1") ----
         # W is (K//2, N) packed fp4 → load (BLOCK_K//2, BLOCK_N)
@@ -835,8 +836,9 @@ def loraq_fused_q8_kernel(
             other=0,
         )
 
-        acc_q += tl.dot_scaled(a_tile, a_scale, "e4m3",
-                               w_tile, w_scale, "e2m1")
+        acc_q = tl.dot_scaled(a_tile, a_scale, "e4m3",
+                               w_tile, w_scale, "e2m1",
+                               acc=acc_q, out_dtype=tl.float32)
 
     # ===== Phase 2 — P × L^T  (fp16 × dequant-fp8→fp16) ====================
 
@@ -1067,8 +1069,9 @@ def loraq_fused_q8_scaled_kernel(
             R_scale_ptr + offs_r[:, None] * stride_rsr + offs_kg[None, :] * stride_rsk,
             mask=offs_kg[None, :] < (K // SCALE_GROUP), other=0,
         )
-        acc_p += tl.dot_scaled(a_tile, a_scale, "e4m3",
-                               r_tile, r_scale, "e4m3")
+        acc_p = tl.dot_scaled(a_tile, a_scale, "e4m3",
+                               r_tile, r_scale, "e4m3",
+                               acc=acc_p, out_dtype=tl.float32)
 
         offs_k_packed = (k0 // 2) + tl.arange(0, BLOCK_K // 2)
         w_tile = tl.load(
@@ -1079,8 +1082,9 @@ def loraq_fused_q8_scaled_kernel(
             W_scale_ptr + rn[:, None] * stride_wsn + offs_kg[None, :] * stride_wsk,
             mask=offs_kg[None, :] < (K // SCALE_GROUP), other=0,
         )
-        acc_q += tl.dot_scaled(a_tile, a_scale, "e4m3",
-                               w_tile, w_scale, "e2m1")
+        acc_q = tl.dot_scaled(a_tile, a_scale, "e4m3",
+                               w_tile, w_scale, "e2m1",
+                               acc=acc_q, out_dtype=tl.float32)
 
     # ===== Phase 2 — P × L^T  via dot_scaled("e4m3","e4m3") ================
     #

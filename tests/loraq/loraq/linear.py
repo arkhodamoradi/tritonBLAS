@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import triton
 
-from fast_loraq.kernels import (
+from loraq.kernels import (
     matmul_kernel,
     matmul_fp4_kernel,
     loraq_project_and_quant_kernel,
@@ -25,7 +25,7 @@ from fast_loraq.kernels import (
     loraq_fused_q8_kernel,
     loraq_fused_q8_scaled_kernel,
 )
-from fast_loraq.quant import (
+from loraq.quant import (
     dynamic_mxfp4_quant,
     dynamic_mxfp8_quant,
     mxfp4_to_f32,

@@ -15,11 +15,11 @@ import time
 import torch
 import torch.nn as nn
 
-from fast_loraq.linear import TritonLinear, TritonLinearFP4, TritonLinearLoRA
-from fast_loraq.linear import TritonLinearLoRaQ, TritonLinearLoRaQFP8
-from fast_loraq.quant import dynamic_mxfp8_quant, dynamic_mxfp4_quant
-from fast_loraq.autotune_configs import AutotunedLoRaQ, LORAQ_Q8_CONFIGS
-from fast_loraq.kernels import loraq_fused_q8_kernel, loraq_fused_q8_scaled_kernel
+from loraq.linear import TritonLinear, TritonLinearFP4, TritonLinearLoRA
+from loraq.linear import TritonLinearLoRaQ, TritonLinearLoRaQFP8
+from loraq.quant import dynamic_mxfp8_quant, dynamic_mxfp4_quant
+from loraq.autotune_configs import AutotunedLoRaQ, LORAQ_Q8_CONFIGS
+from loraq.kernels import loraq_fused_q8_kernel, loraq_fused_q8_scaled_kernel
 
 # ---------------------------------------------------------------------------
 # Configuration

@@ -1,13 +1,13 @@
 """fast_loraq – Triton-accelerated linear layers."""
 
-from fast_loraq.linear import (
+from loraq.linear import (
     TritonLinear,
     TritonLinearFP4,
     TritonLinearLoRA,
     TritonLinearLoRaQ,
     TritonLinearLoRaQFP8,
 )
-from fast_loraq.quant import (
+from loraq.quant import (
     dynamic_mxfp4_quant,
     dynamic_mxfp8_quant,
     mxfp4_to_f32,

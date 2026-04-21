@@ -12,7 +12,7 @@ Provides:
 import torch
 import triton
 
-from fast_loraq.kernels import _mxfp4_quant_kernel, _mxfp8_quant_kernel
+from loraq.kernels import _mxfp4_quant_kernel, _mxfp8_quant_kernel
 
 
 # -- quantize ---------------------------------------------------------------
