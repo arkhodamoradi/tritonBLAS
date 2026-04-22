@@ -29,69 +29,42 @@ import triton.testing as tt
 
 LORAQ_Q8_CONFIGS = [
     # ---- Standard configs (good for M ≥ 128) ----
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=8, num_stages=2,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE_M": 8},
-        num_warps=8, num_stages=2,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=4, num_stages=2,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 1},
-        num_warps=8, num_stages=1,
-    ),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 1}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE_M": 1}, num_warps=8, num_stages=2),
     # ---- Large tiles (good for large M, N) ----
-    triton.Config(
-        {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=8, num_stages=2,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=8, num_stages=2,
-    ),
-    triton.Config(
-        {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 1},
-        num_warps=8, num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE_M": 8},
-        num_warps=8, num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_SIZE_M": 4},
-        num_warps=8, num_stages=1,
-    ),
+    triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_SIZE_M": 1}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 1}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_SIZE_M": 1}, num_warps=8, num_stages=2),
     # ---- Small tiles (good for small M, decode) ----
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=4, num_stages=2,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=4, num_stages=2,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE_M": 8},
-        num_warps=8, num_stages=2,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=8, num_stages=2,
-    ),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 8}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=2),
     # ---- num_stages=1 variants ----
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=8, num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE_M": 4},
-        num_warps=8, num_stages=1,
-    ),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=1),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=1),
+    triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 1}, num_warps=8, num_stages=1),
+    triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_SIZE_M": 1}, num_warps=8, num_stages=1),
+    triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=1),
+    # ---- num_warps=4 variants ----
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 4}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 4}, num_warps=4, num_stages=2),
 ]
 
 
@@ -182,6 +155,7 @@ class AutotunedLoRaQ:
                 GROUP_SIZE_M=gm,
                 num_warps=nw,
                 num_stages=ns,
+                matrix_instr_nonkdim=32,
             )
         return launch
 
@@ -295,6 +269,7 @@ class AutotunedLoRaQ:
             GROUP_SIZE_M=gm,
             num_warps=cfg.num_warps,
             num_stages=cfg.num_stages,
+            matrix_instr_nonkdim=32,
         )
 
         c_fp8 = c_fp8.view(torch.float8_e4m3fn)
@@ -501,6 +476,7 @@ class AutotunedDualGEMM:
                 GROUP_SIZE_M=gm,
                 num_warps=nw,
                 num_stages=ns,
+                matrix_instr_nonkdim=32,
             )
         return launch
 
@@ -589,6 +565,7 @@ class AutotunedDualGEMM:
             GROUP_SIZE_M=gm,
             num_warps=cfg.num_warps,
             num_stages=cfg.num_stages,
+            matrix_instr_nonkdim=32,
         )
 
         return C

@@ -718,30 +718,30 @@ def loraq_fused_q8_kernel(
     # ---- outputs ----
     C_fp8_ptr,          # (M, N)     uint8  (will be viewed as float8_e4m3fn)
     C_scale_ptr,        # (M, N//32) uint8 e8m0
-    # ---- dimensions ----
-    M, N, K,
+    # ---- dimensions (constexpr for full compile-time optimization) ----
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
     # ---- strides: A_fp8 (M, K) ----
-    stride_am, stride_ak,
+    stride_am: tl.constexpr, stride_ak: tl.constexpr,
     # ---- strides: A_scale (M, K//32) ----
-    stride_asm, stride_ask,
+    stride_asm: tl.constexpr, stride_ask: tl.constexpr,
     # ---- strides: R_fp8 (RANK, K) ----
-    stride_rr, stride_rk,
+    stride_rr: tl.constexpr, stride_rk: tl.constexpr,
     # ---- strides: R_scale (RANK, K//32) ----
-    stride_rsr, stride_rsk,
+    stride_rsr: tl.constexpr, stride_rsk: tl.constexpr,
     # ---- strides: L_fp8 (N, RANK) ----
-    stride_ln, stride_lr,
+    stride_ln: tl.constexpr, stride_lr: tl.constexpr,
     # ---- strides: L_scale (N, RANK//32) ----
-    stride_lsn, stride_lsk,
+    stride_lsn: tl.constexpr, stride_lsk: tl.constexpr,
     # ---- strides: W_fp4 (K//2, N) ----
-    stride_wk, stride_wn,
+    stride_wk: tl.constexpr, stride_wn: tl.constexpr,
     # ---- strides: W_scale (N, K//32) ----
-    stride_wsn, stride_wsk,
+    stride_wsn: tl.constexpr, stride_wsk: tl.constexpr,
     # ---- strides: C_fp8 (M, N) ----
-    stride_cm, stride_cn,
+    stride_cm: tl.constexpr, stride_cn: tl.constexpr,
     # ---- strides: C_scale (M, N//32) ----
-    stride_csm, stride_csn,
+    stride_csm: tl.constexpr, stride_csn: tl.constexpr,
     # ---- stride: channel_scale (N,) ----
-    stride_cs,
+    stride_cs: tl.constexpr,
     # ---- compile-time constants ----
     HAS_BIAS: tl.constexpr,
     RANK: tl.constexpr,            # 64
@@ -776,6 +776,10 @@ def loraq_fused_q8_kernel(
              in-register MXFP8 quantization.
              Groups of 32 along N each get an e8m0 scale.
 
+    All dimensions and strides are constexpr for full compile-time
+    optimization (loop unrolling, address arithmetic, dead code elimination).
+    Recompiles per unique (M, N, K) shape.
+
     Grid: (ceil(M/BLOCK_M) * ceil(N/BLOCK_N),)
     """
     SCALE_GROUP: tl.constexpr = 32
@@ -808,6 +812,7 @@ def loraq_fused_q8_kernel(
     loop_k = tl.cdiv(K, BLOCK_K)
 
     for k in range(0, loop_k):
+        
         k0 = k * BLOCK_K
         offs_k = k0 + tl.arange(0, BLOCK_K)
         offs_kg = (k0 // SCALE_GROUP) + tl.arange(0, BLOCK_K // SCALE_GROUP)
@@ -971,7 +976,6 @@ def loraq_fused_q8_kernel(
         scale_e8m0, mask=s_mask,
     )
 
-
 # ===========================================================================
 # Kernel 8 -- LoRaQ (FP8 variant): Phase 2 uses dot_scaled("e4m3","e4m3")
 #   C_fp8 = q8( q8(q8(A) @ q8(R)^T) @ q8(L)^T  +  q8(A) @ q4(W)^T )
@@ -998,7 +1002,7 @@ def loraq_fused_q8_scaled_kernel(
     # ---- outputs ----
     C_fp8_ptr,          # (M, N)     uint8  (will be viewed as float8_e4m3fn)
     C_scale_ptr,        # (M, N//32) uint8 e8m0
-    # ---- dimensions ----
+    # ---- dimensions (runtime — constexpr causes MLIR crash for this kernel) ----
     M, N, K,
     # ---- strides: A_fp8 (M, K) ----
     stride_am, stride_ak,
@@ -1051,6 +1055,10 @@ def loraq_fused_q8_scaled_kernel(
 
     Phases 1 and 3 are identical to Kernel 7.
 
+    NOTE: dimensions and strides are runtime (not constexpr) because the
+    in-register MXFP8 quantization in Phase 2 causes an MLIR compiler
+    crash (ConvertTritonAMDGPUToLLVM) when combined with constexpr dims.
+
     Grid: (ceil(M/BLOCK_M) * ceil(N/BLOCK_N),)
     """
     SCALE_GROUP: tl.constexpr = 32
@@ -1086,14 +1094,16 @@ def loraq_fused_q8_scaled_kernel(
         k0 = k * BLOCK_K
         offs_k = k0 + tl.arange(0, BLOCK_K)
         offs_kg = (k0 // SCALE_GROUP) + tl.arange(0, BLOCK_K // SCALE_GROUP)
-
+        
+        s_mask = offs_kg[None, :] < (K // SCALE_GROUP)
+        
         a_tile = tl.load(
             A_fp8_ptr + rm[:, None] * stride_am + offs_k[None, :] * stride_ak,
             mask=offs_k[None, :] < K, other=0.0,
         )
         a_scale = tl.load(
             A_scale_ptr + rm[:, None] * stride_asm + offs_kg[None, :] * stride_ask,
-            mask=offs_kg[None, :] < (K // SCALE_GROUP), other=0,
+            mask=s_mask, other=0,
         )
 
         r_tile = tl.load(
@@ -1102,7 +1112,7 @@ def loraq_fused_q8_scaled_kernel(
         )
         r_scale = tl.load(
             R_scale_ptr + offs_r[:, None] * stride_rsr + offs_kg[None, :] * stride_rsk,
-            mask=offs_kg[None, :] < (K // SCALE_GROUP), other=0,
+            mask=s_mask, other=0,
         )
         acc_p = tl.dot_scaled(a_tile, a_scale, "e4m3",
                                r_tile, r_scale, "e4m3",
@@ -1115,7 +1125,7 @@ def loraq_fused_q8_scaled_kernel(
         )
         w_scale = tl.load(
             W_scale_ptr + rn[:, None] * stride_wsn + offs_kg[None, :] * stride_wsk,
-            mask=offs_kg[None, :] < (K // SCALE_GROUP), other=0,
+            mask=s_mask, other=0,
         )
         acc_q = tl.dot_scaled(a_tile, a_scale, "e4m3",
                                w_tile, w_scale, "e2m1",

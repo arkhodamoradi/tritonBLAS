@@ -718,8 +718,10 @@ if __name__ == "__main__":
     NUM_WARPS = 8 # 8
     NUM_STAGES = 2 # 2
     NONKDIM = 16 if BK%128==0 else 32
-    AFMTS = ["e4m3", "e5m2", "e2m3", "e3m2", "e2m1"] 
-    BFMTS = ["e4m3", "e5m2", "e2m3", "e3m2", "e2m1"]
+    #AFMTS = ["e4m3", "e5m2", "e2m3", "e3m2", "e2m1"] 
+    AFMTS = ["e4m3", "e2m1"] 
+    #BFMTS = ["e4m3", "e5m2", "e2m3", "e3m2", "e2m1"]
+    BFMTS = ["e4m3", "e2m1"]
     STRINGS = ["buffer_load_ubyte", "buffer_load_sbyte", "buffer_load_ushort", "buffer_load_dword ", "buffer_load_dwordx2", "v_mfma_scale_f32_32x32x64_f8f6f4", "v_mfma_scale_f32_16x16x128_f8f6f4"]
     torch.manual_seed(123)
     A = torch.randn((M, K), device="cuda")

@@ -21,7 +21,9 @@ import torch.nn as nn
 import triton
 import triton.testing as tt
 
-from loraq.kernels import loraq_fused_q8_kernel, loraq_fused_q8_scaled_kernel
+from loraq.kernels import (
+    loraq_fused_q8_kernel, loraq_fused_q8_scaled_kernel
+)
 from loraq.quant import dynamic_mxfp4_quant, dynamic_mxfp8_quant
 
 
@@ -32,21 +34,22 @@ from loraq.quant import dynamic_mxfp4_quant, dynamic_mxfp8_quant
 # Problem sizes to test
 SIZES = [
     # (M,     K,     N)
-    (128,   4096,  4096),
-    (256,   4096,  4096),
-    (512,   4096,  4096),
-    (1024,  4096,  4096),
-    (128,   4096,  11008),
-    (128,   8192,  8192),
+    #(4096,   4096,  4096),
+    (4096,   3072,  12288),
+    #(256,   4096,  4096),
+    #(512,   4096,  4096),
+    #(1024,  4096,  4096),
+    #(128,   4096,  11008),
+    #(128,   8192,  8192),
 ]
 
 # Hyperparameter grid
-BLOCK_MS = [64, 128, 256]
-BLOCK_NS = [64, 128, 256]
-BLOCK_KS = [64, 128]           # ≥64 required for dot_scaled
-GROUP_MS = [1, 4, 8]
-NUM_WARPS_LIST = [4, 8]
-NUM_STAGES_LIST = [1, 2]
+BLOCK_MS = [128,256]#[64, 128, 256]
+BLOCK_NS = [128,256]#[64, 128, 256]
+BLOCK_KS = [128]#[64, 128]           # ≥64 required for dot_scaled
+GROUP_MS = [1,4,8]#[1, 4, 8]
+NUM_WARPS_LIST = [4,8] #[4, 8]
+NUM_STAGES_LIST = [2] #[1, 2]
 
 RANK = 64
 WARMUP = 10
@@ -193,6 +196,7 @@ def try_config(kernel_fn, a_fp8, a_scale, r_fp8, r_scale, l_fp8, l_scale,
                 GROUP_SIZE_M=group_m,
                 num_warps=num_warps,
                 num_stages=num_stages,
+                matrix_instr_nonkdim=32,
             ),
             warmup=WARMUP,
             rep=REP,
@@ -277,7 +281,6 @@ def sweep_kernel(kernel_fn, kernel_name, sizes, max_configs=None):
 
     return all_results
 
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -315,7 +318,6 @@ def main():
             loraq_fused_q8_scaled_kernel, "LoRaQ_V2", SIZES,
             max_configs=args.max_configs,
         )
-
     # Assembly inspection
     if args.check_asm:
         print("\n" + "=" * 80)

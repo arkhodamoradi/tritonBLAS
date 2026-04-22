@@ -14,6 +14,8 @@ import time
 
 import torch
 import torch.nn as nn
+import triton
+import triton.testing as tt
 
 from loraq.linear import TritonLinear, TritonLinearFP4, TritonLinearLoRA
 from loraq.linear import TritonLinearLoRaQ, TritonLinearLoRaQFP8
@@ -50,6 +52,7 @@ SIZES = [
     #(1024,  4096,  14336),
     #(2048,  4096,  4096),    # large batch
     (4096, 1152, 1152), #Pixart qkv
+    (4096, 1152, 3*1152), #Pixart qkv
     (4096, 4608, 1152), # pixart ffn down
     (4096, 1152, 4608), # pixart ffn up
     (512, 3072, 3072), # flux
@@ -57,7 +60,7 @@ SIZES = [
     (4096,3072,3072),
     (4096,12288,3072),
     (4096,3072,12288),
-    #(4096,  4096,  4096),    # large batch
+    (4096,  4096,  4096),    # large batch
 ]
 
 WARMUP = 25
@@ -459,29 +462,28 @@ def bench_v1_vs_loraq(sizes):
 
 def bench_v1_vs_loraq_autotuned(sizes):
     """
-    V1 (LoRaQ) autotuned vs LoRA+Q autotuned — both at their best configs.
+    V1 (LoRaQ) autotuned vs LoRA+Q autotuned — all at best configs.
 
-    V1 uses AutotunedLoRaQ to sweep 15 tile configs for kernel 7.
-    LoRA+Q uses kernel 5 (fixed BLOCK_M=128) + AutotunedDualGEMM for kernel 6.
-    End-to-end LoRA+Q time = kernel 5 time + autotuned kernel 6 time.
+    V1 uses AutotunedLoRaQ with kernel 7 (tl.dot fp16 Phase 2).
+    LoRA+Q uses AutotunedProjectAndQuant (kernel 5) + AutotunedDualGEMM (kernel 6).
 
-    Both layers store W as MXFP4 (quantized from the same nn.Linear).
+    All layers store W as MXFP4 (quantized from the same nn.Linear).
     V1 takes pre-quantized MXFP8 activation; LoRA+Q takes raw fp16.
     """
     rows = []
-    W = 160
+    W = 165
     print("\n" + "=" * W)
-    print("  V1-Autotuned vs LoRA+Q-Autotuned  (both fully autotuned)")
-    print("  V1: rank=64, MXFP8 L/R, pre-quantized input, autotuned kernel 7")
-    print("  LoRA+Q: rank=32, fp16 L/R, raw fp16 input, autotuned kernel 5 + autotuned kernel 6")
+    print("  V1-Autotuned vs LoRA+Q-Autotuned  (all fully autotuned)")
+    print("  V1: rank=64, Phase 2 = tl.dot fp16, autotuned kernel 7")
+    print("  LoRA+Q: rank=32, fp16 L/R, autotuned kernels 5+6 (end-to-end)")
     print("=" * W)
     header = (
         f"{'M':>6} {'K':>6} {'N':>6}  "
         f"{'LQ-tuned µs':>12} {'LQ TFLOPS':>10}  "
         f"{'V1-tuned µs':>12} {'V1 TFLOPS':>10}  "
-        f"{'V1/LQ':>7}  "
+        f"{'V1/LQ':>6}  "
         f"{'fp16 µs':>9}  "
-        f"{'Best LQ K5,K6':>25} {'Best V1 K7':>25}"
+        f"{'Best V1 K7':>40}"
     )
     print(header)
     print("-" * W)
@@ -502,39 +504,37 @@ def bench_v1_vs_loraq_autotuned(sizes):
         loraq_layer = TritonLinearLoRA.from_float(ref_linear)   # rank=32, fp16 L/R
         v1_layer    = TritonLinearLoRaQ.from_float(ref_linear)  # rank=64, MXFP8 L/R
 
-        # ---- LoRA+Q autotuned: kernel 5 (autotuned) + kernel 6 (autotuned) ----
-        # Pre-compute kernel 5 outputs for kernel 6 autotuning
-        P, a_fp4, a_scale_q = at_pq(x, loraq_layer.R, loraq_layer.channel_scale)
+        # ---- LoRA+Q autotuned: kernel 5 + kernel 6 end-to-end ----
         w_fp4_t_lq = loraq_layer.weight_fp4.t().contiguous()
+        P, a_fp4, a_scale_q = at_pq(x, loraq_layer.R, loraq_layer.channel_scale)
+        _ = at_dg(P, loraq_layer.L, a_fp4, a_scale_q,
+                  w_fp4_t_lq, loraq_layer.weight_scale, M, N, K)
 
-        # Time kernel 5 autotuned
-        t_k5 = benchmark_fn(
-            lambda: at_pq(x, loraq_layer.R, loraq_layer.channel_scale)
-        )
+        def loraq_e2e():
+            P_, a_fp4_, a_scale_q_ = at_pq(x, loraq_layer.R, loraq_layer.channel_scale)
+            at_dg(P_, loraq_layer.L, a_fp4_, a_scale_q_,
+                  w_fp4_t_lq, loraq_layer.weight_scale, M, N, K)
 
-        # Time kernel 6 autotuned
-        t_k6_tuned = benchmark_fn(
-            lambda: at_dg(
-                P, loraq_layer.L,
-                a_fp4, a_scale_q,
-                w_fp4_t_lq, loraq_layer.weight_scale,
-                M, N, K,
-            )
-        )
-
-        t_loraq_tuned = t_k5 + t_k6_tuned
+        t_loraq_ms = tt.do_bench(loraq_e2e, warmup=WARMUP, rep=ITERS)
+        t_loraq_tuned = t_loraq_ms / 1000.0
 
         # ---- V1 autotuned ----
         w_fp4_t_v1 = v1_layer.weight_fp4.t().contiguous()
-        t_v1_tuned = benchmark_fn(
+        _ = at_v1(a_fp8, a_scale,
+                  v1_layer.R_fp8, v1_layer.R_scale,
+                  v1_layer.L_fp8, v1_layer.L_scale,
+                  w_fp4_t_v1, v1_layer.weight_scale, M, N, K)
+
+        t_v1_ms = tt.do_bench(
             lambda: at_v1(
                 a_fp8, a_scale,
                 v1_layer.R_fp8, v1_layer.R_scale,
                 v1_layer.L_fp8, v1_layer.L_scale,
-                w_fp4_t_v1, v1_layer.weight_scale,
-                M, N, K,
-            )
+                w_fp4_t_v1, v1_layer.weight_scale, M, N, K,
+            ),
+            warmup=WARMUP, rep=ITERS,
         )
+        t_v1_tuned = t_v1_ms / 1000.0
 
         # fp16 reference
         t_fp16 = benchmark_fn(lambda: ref_linear(x))
@@ -544,20 +544,7 @@ def bench_v1_vs_loraq_autotuned(sizes):
 
         v1_over_loraq = t_loraq_tuned / t_v1_tuned if t_v1_tuned > 0 else float("inf")
 
-        # Config strings
-        best_pq = at_pq.get_best_config(M, K)
-        k5_bm = best_pq["block_m"] if best_pq else 128
-
-        best_dg = at_dg.get_best_config(M, N, K)
-        lq_cfg = ""
-        if best_dg:
-            c = best_dg["config"]
-            lq_cfg = (f"K5:BM={k5_bm},"
-                      f"K6:BM={c.kwargs['BLOCK_M']},"
-                      f"BN={c.kwargs['BLOCK_N']},"
-                      f"BK={c.kwargs['BLOCK_K']},"
-                      f"w={c.num_warps}")
-
+        # Best V1 config string
         best_v1 = at_v1.get_best_config(M, N, K)
         v1_cfg = ""
         if best_v1:
@@ -565,30 +552,102 @@ def bench_v1_vs_loraq_autotuned(sizes):
             v1_cfg = (f"BM={c.kwargs['BLOCK_M']},"
                       f"BN={c.kwargs['BLOCK_N']},"
                       f"BK={c.kwargs['BLOCK_K']},"
-                      f"w={c.num_warps}")
+                      f"GM={c.kwargs['GROUP_SIZE_M']},"
+                      f"w={c.num_warps},s={c.num_stages}")
 
         print(
             f"{M:>6} {K:>6} {N:>6}  "
             f"{us(t_loraq_tuned):>11.1f}µ {tf_loraq:>9.2f}  "
             f"{us(t_v1_tuned):>11.1f}µ {tf_v1:>9.2f}  "
-            f"{v1_over_loraq:>6.2f}x  "
+            f"{v1_over_loraq:>5.2f}x  "
             f"{us(t_fp16):>8.1f}µ  "
-            f"{lq_cfg:>25} {v1_cfg:>25}"
+            f"{v1_cfg:>40}"
         )
         rows.append({
             "M": M, "K": K, "N": N,
             "loraq_tuned_us":  round(us(t_loraq_tuned), 1),
-            "loraq_k5_us":     round(us(t_k5), 1),
-            "loraq_k6_us":     round(us(t_k6_tuned), 1),
             "loraq_tflops":    round(tf_loraq, 3),
             "v1_tuned_us":     round(us(t_v1_tuned), 1),
             "v1_tflops":       round(tf_v1, 3),
             "v1_over_loraq":   round(v1_over_loraq, 3),
             "fp16_us":         round(us(t_fp16), 1),
-            "best_lq_config":  lq_cfg,
             "best_v1_config":  v1_cfg,
             "loraq_rank": 32,
             "v1_rank": 64,
+        })
+
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# V1-autotuned vs LoRA+Q (wall-clock benchmark_fn version)
+# ---------------------------------------------------------------------------
+
+def bench_v1_vs_loraq_wallclock(sizes):
+    """
+    V1 vs LoRA+Q using actual module forward() calls with benchmark_fn.
+
+    Both modules now autotune internally on first call, so this benchmarks
+    the fully-optimized modules including all Python dispatch overhead.
+    """
+    rows = []
+    W = 130
+    print("\n" + "=" * W)
+    print("  V1 vs LoRA+Q  (actual modules, wall-clock benchmark_fn)")
+    print("  V1: TritonLinearLoRaQ.forward() — autotuned kernel 7")
+    print("  LoRA+Q: TritonLinearLoRA.forward() — autotuned kernels 5+6")
+    print("  NOTE: first call triggers autotuning; subsequent calls use cached config")
+    print("=" * W)
+    header = (
+        f"{'M':>6} {'K':>6} {'N':>6}  "
+        f"{'LoRA+Q µs':>10} {'LQ TFLOPS':>10}  "
+        f"{'V1 µs':>10} {'V1 TFLOPS':>10}  "
+        f"{'V1/LQ':>6}  "
+        f"{'fp16 µs':>9}"
+    )
+    print(header)
+    print("-" * W)
+
+    for M, K, N in sizes:
+        if K % 64 != 0 or N % 32 != 0:
+            continue
+
+        x = torch.randn(M, K, device="cuda", dtype=torch.float16)
+        a_fp8, a_scale = dynamic_mxfp8_quant(x)
+        ref_linear = nn.Linear(K, N, bias=False, device="cuda", dtype=torch.float16)
+
+        loraq_layer = TritonLinearLoRA.from_float(ref_linear)
+        v1_layer    = TritonLinearLoRaQ.from_float(ref_linear)
+
+        # Warmup / trigger autotuning (first call tunes)
+        _ = loraq_layer(x)
+        _ = v1_layer(a_fp8, a_scale)
+
+        # Measure actual module forward() with benchmark_fn
+        t_loraq = benchmark_fn(lambda: loraq_layer(x))
+        t_v1    = benchmark_fn(lambda: v1_layer(a_fp8, a_scale))
+        t_fp16  = benchmark_fn(lambda: ref_linear(x))
+
+        tf_loraq = tflops(M, N, K, t_loraq)
+        tf_v1    = tflops(M, N, K, t_v1)
+
+        v1_over_loraq = t_loraq / t_v1 if t_v1 > 0 else float("inf")
+
+        print(
+            f"{M:>6} {K:>6} {N:>6}  "
+            f"{us(t_loraq):>9.1f}µ {tf_loraq:>9.2f}  "
+            f"{us(t_v1):>9.1f}µ {tf_v1:>9.2f}  "
+            f"{v1_over_loraq:>5.2f}x  "
+            f"{us(t_fp16):>8.1f}µ"
+        )
+        rows.append({
+            "M": M, "K": K, "N": N,
+            "loraq_us":    round(us(t_loraq), 1),
+            "loraq_tflops": round(tf_loraq, 3),
+            "v1_us":       round(us(t_v1), 1),
+            "v1_tflops":   round(tf_v1, 3),
+            "v1_over_loraq": round(v1_over_loraq, 3),
+            "fp16_us":     round(us(t_fp16), 1),
         })
 
     return rows
@@ -699,6 +758,7 @@ def main():
     parser.add_argument("--v1-vs-loraq",     action="store_true", help="Compare V1 (LoRaQ) vs LoRA+Q (rank-32)")
     parser.add_argument("--v1-vs-loraq-tuned", action="store_true", help="V1-autotuned vs LoRA+Q (best configs)")
     parser.add_argument("--autotuned-only",  action="store_true", help="Run autotuned vs fixed-config comparison")
+    parser.add_argument("--v1-vs-loraq-wallclock", action="store_true", help="V1 vs LoRA+Q with wall-clock benchmark_fn")
     args = parser.parse_args()
 
     results = {}
@@ -707,6 +767,7 @@ def main():
         args.fp4_only or args.fp_only or args.loraq_only
         or args.loraq_q8_only or args.v1_vs_loraq
         or args.v1_vs_loraq_tuned or args.autotuned_only
+        or args.v1_vs_loraq_wallclock
     )
 
     if run_all or args.fp_only:
@@ -729,6 +790,9 @@ def main():
 
     if args.autotuned_only:
         results["autotuned"] = bench_autotuned(SIZES)
+
+    if args.v1_vs_loraq_wallclock:
+        results["v1_vs_loraq_wallclock"] = bench_v1_vs_loraq_wallclock(SIZES)
 
     if args.json:
         with open(args.json, "w") as f:

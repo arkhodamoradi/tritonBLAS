@@ -32,6 +32,12 @@ from loraq.quant import (
     mxfp8_to_f32,
     e8m0_to_f32,
 )
+from loraq.autotune_configs import (
+    AutotunedLoRaQ,
+    AutotunedDualGEMM,
+    AutotunedProjectAndQuant,
+    LORAQ_Q8_CONFIGS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +602,7 @@ def triton_loraq_dual_gemm(
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
         GROUP_SIZE_M=GROUP_SIZE_M,
+        matrix_instr_nonkdim=16 if BLOCK_K % 128 == 0 else 32,
     )
 
     return C
@@ -771,19 +778,31 @@ class TritonLinearLoRA(nn.Module):
                 dummy.bias.copy_(bias)
         return cls.from_float(dummy, rank=rank, out_dtype=out_dtype)
 
+    # ----- autotuners (class-level, shared across instances) ----- #
+    _at_pq: AutotunedProjectAndQuant | None = None
+    _at_dg: AutotunedDualGEMM | None = None
+
+    def _get_autotuners(self):
+        """Lazy-init autotuners on first use."""
+        if TritonLinearLoRA._at_pq is None:
+            TritonLinearLoRA._at_pq = AutotunedProjectAndQuant(
+                loraq_project_and_quant_kernel, rank=self.rank, warmup=5, rep=25,
+            )
+        if TritonLinearLoRA._at_dg is None:
+            TritonLinearLoRA._at_dg = AutotunedDualGEMM(
+                loraq_dual_gemm_kernel, LORAQ_Q8_CONFIGS, rank=self.rank, warmup=5, rep=25,
+            )
+        return TritonLinearLoRA._at_pq, TritonLinearLoRA._at_dg
+
     # ----- forward ----- #
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass:
+        Forward pass with autotuned kernels:
 
             out = A @ R^T @ L^T  +  Q(A) @ Q(W)^T  +  bias
 
-        Two fused kernels:
-        1. ``loraq_project_and_quant_kernel``: computes P = A @ R^T and
-           quantizes A to MXFP4 in a single pass.
-        2. ``loraq_dual_gemm_kernel``: computes P @ L^T + Q(A) @ Q(W)^T
-           in a single tiled output kernel.
+        Kernels are autotuned on first call for each (M, K) / (M, N, K) shape.
         """
         orig_shape = x.shape
         x_2d = x.reshape(-1, self.in_features).contiguous()
@@ -794,16 +813,16 @@ class TritonLinearLoRA(nn.Module):
         K = self.in_features
         N = self.out_features
 
-        # Kernel 1: fused projection + quantization
-        P, a_fp4, a_scale = triton_loraq_project_and_quant(
-            x_2d, self.R, self.channel_scale,
-        )
+        at_pq, at_dg = self._get_autotuners()
+
+        # Kernel 1: autotuned fused projection + quantization
+        P, a_fp4, a_scale = at_pq(x_2d, self.R, self.channel_scale)
 
         # Weight transpose for kernel 2
-        w_fp4_t = self.weight_fp4.t().contiguous()  # (K//2, N)
+        w_fp4_t = self.weight_fp4.t().contiguous()
 
-        # Kernel 2: fused dual GEMM
-        out = triton_loraq_dual_gemm(
+        # Kernel 2: autotuned fused dual GEMM
+        out = at_dg(
             P, self.L,
             a_fp4, a_scale,
             w_fp4_t, self.weight_scale,
@@ -933,6 +952,7 @@ def triton_loraq_fused_q8(
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
         GROUP_SIZE_M=GROUP_SIZE_M,
+        matrix_instr_nonkdim=16 if BLOCK_K % 128 == 0 else 32,
     )
 
     # Reinterpret raw bytes as float8_e4m3fn
@@ -1149,6 +1169,18 @@ class TritonLinearLoRaQ(nn.Module):
                 dummy.bias.copy_(bias)
         return cls.from_float(dummy, rank=rank)
 
+    # ----- autotuner (class-level, shared across instances) ----- #
+    _at_v1: AutotunedLoRaQ | None = None
+
+    def _get_autotuner(self):
+        """Lazy-init autotuner on first use."""
+        if TritonLinearLoRaQ._at_v1 is None:
+            TritonLinearLoRaQ._at_v1 = AutotunedLoRaQ(
+                loraq_fused_q8_kernel, LORAQ_Q8_CONFIGS,
+                rank=self.rank, warmup=5, rep=25,
+            )
+        return TritonLinearLoRaQ._at_v1
+
     # ----- forward ----- #
 
     def forward(
@@ -1157,7 +1189,10 @@ class TritonLinearLoRaQ(nn.Module):
         a_scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass — takes pre-quantized MXFP8 activation.
+        Forward pass with autotuned kernel — takes pre-quantized MXFP8 activation.
+
+        Autotuned on first call for each (M, N, K) shape. Subsequent calls
+        use the cached best config directly.
 
         Parameters
         ----------
@@ -1177,10 +1212,10 @@ class TritonLinearLoRaQ(nn.Module):
         K = self.in_features
         N = self.out_features
 
-        # Transpose weight for kernel (N, K//2) → (K//2, N)
         w_fp4_t = self.weight_fp4.t().contiguous()
 
-        c_fp8, c_scale = triton_loraq_fused_q8(
+        at_v1 = self._get_autotuner()
+        c_fp8, c_scale = at_v1(
             a_fp8_2d, a_scale_2d,
             self.R_fp8, self.R_scale,
             self.L_fp8, self.L_scale,
@@ -1282,6 +1317,7 @@ def triton_loraq_fused_q8_scaled(
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
         GROUP_SIZE_M=GROUP_SIZE_M,
+        matrix_instr_nonkdim=16 if BLOCK_K % 128 == 0 else 32,
     )
 
     C_fp8 = C_fp8.view(torch.float8_e4m3fn)
