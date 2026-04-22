@@ -46,7 +46,7 @@ SIZES = [
 # Hyperparameter grid
 BLOCK_MS = [128,256]#[64, 128, 256]
 BLOCK_NS = [128,256]#[64, 128, 256]
-BLOCK_KS = [128]#[64, 128]           # ≥64 required for dot_scaled
+BLOCK_KS = [128,256]#[64, 128]           # ≥64 required for dot_scaled
 GROUP_MS = [1,4,8]#[1, 4, 8]
 NUM_WARPS_LIST = [4,8] #[4, 8]
 NUM_STAGES_LIST = [2] #[1, 2]
@@ -281,6 +281,7 @@ def sweep_kernel(kernel_fn, kernel_name, sizes, max_configs=None):
 
     return all_results
 
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -318,6 +319,7 @@ def main():
             loraq_fused_q8_scaled_kernel, "LoRaQ_V2", SIZES,
             max_configs=args.max_configs,
         )
+
     # Assembly inspection
     if args.check_asm:
         print("\n" + "=" * 80)

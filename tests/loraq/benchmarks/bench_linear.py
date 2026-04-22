@@ -662,7 +662,7 @@ def bench_autotuned(sizes):
     W = 130
     print("\n" + "=" * W)
     print("  Autotuned Benchmark: fixed-config  vs  autotuned LoRaQ (V1 & V2)")
-    print("  Note: first run for each (M,K,N) triggers autotuning (15 configs × do_bench)")
+    print("  Note: first run for each (M,K,N) triggers autotuning (31 configs × do_bench)")
     print("=" * W)
     header = (
         f"{'M':>6} {'K':>6} {'N':>6}  "

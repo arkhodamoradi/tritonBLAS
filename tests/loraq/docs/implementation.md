@@ -23,23 +23,19 @@ purely for inference.
 ## Project structure
 
 ```
-fast_loraq/
-├── fast_loraq/
+loraq/
+├── loraq/
 │   ├── __init__.py              # Public API (re-exports all layers + quant utils)
 │   ├── kernels.py               # 8 Triton JIT kernels
 │   ├── linear.py                # 5 nn.Module layer classes + Python wrappers
 │   ├── quant.py                 # MXFP4/MXFP8 quantization + dequantization
 │   └── autotune_configs.py      # Autotune configs + AutotunedLoRaQ runtime tuner
-├── tests/
-│   ├── __init__.py
-│   └── test_linear.py           # Correctness tests (pytest)
 ├── benchmarks/
 │   ├── bench_linear.py          # TFLOPS benchmark (all layers)
 │   ├── sweep_loraq.py           # Hyperparameter sweep for LoRaQ kernels
 │   └── profile_loraq.py         # Proton profiling + assembly inspection
 ├── docs/
-│   └── implementation.md        # This document
-└── pyproject.toml
+    └── implementation.md        # This document
 ```
 
 ---
@@ -195,26 +191,6 @@ c_fp8, c_scale = autotuned(a_fp8, a_scale, r_fp8, r_scale,
 ---
 
 ## Running the code
-
-### Installation
-
-```bash
-cd fast_loraq
-pip install -e ".[dev]"
-```
-
-### Tests
-
-```bash
-# Run all tests
-pytest tests/ -v
-
-# Run only LoRaQ FP8 tests
-pytest tests/test_linear.py -v -k "loraq_q8 or loraq_fp8 or loraq_v1_vs_v2"
-
-# Run only dimension/rank rejection tests (no GPU needed)
-pytest tests/test_linear.py -v -k "rejects"
-```
 
 ### Benchmarks
 

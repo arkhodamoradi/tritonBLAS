@@ -484,7 +484,7 @@ def loraq_project_and_quant_kernel(
         a_tile = tl.load(
             A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak,
             mask=a_mask, other=0.0,
-        ).to(tl.float32)
+        ).to(tl.float16)
 
         # --- load R tile  (RANK, 32) ---
         r_mask = offs_k[None, :] < K
@@ -495,7 +495,7 @@ def loraq_project_and_quant_kernel(
         # r_tile is (RANK, 32),  we need (32, RANK) for the dot  a_tile @ r_tile^T
         # tl.dot expects (BLOCK_M, 32) @ (32, RANK) -> (BLOCK_M, RANK)
         r_tile_t = tl.trans(r_tile)                      # (32, RANK)
-        acc_p = tl.dot(a_tile.to(tl.float16), r_tile_t, acc=acc_p, out_dtype=tl.float32)
+        acc_p = tl.dot(a_tile, r_tile_t, acc=acc_p, out_dtype=tl.float32)
 
         # ===== MXFP4 quantisation of this 32-element group ==================
 
@@ -503,7 +503,7 @@ def loraq_project_and_quant_kernel(
         cs = tl.load(
             channel_scale_ptr + offs_k * stride_cs,
             mask=offs_k < K, other=1.0,
-        ).to(tl.float32)                            # (QUANT_GROUP,)
+        ).to(tl.float16)                            # (QUANT_GROUP,)
         a_tile_scaled = a_tile * cs[None, :]         # (BLOCK_M, QUANT_GROUP)
 
         # --- e8m0 scale ---
@@ -869,9 +869,6 @@ def loraq_fused_q8_kernel(
 
     # ===== Phase 2 — P × L^T  (fp16 × dequant-fp8→fp16) ====================
 
-    # Cast projection to fp16
-    p_fp16 = acc_p.to(tl.float16)   # (BLOCK_M, RANK=64)
-
     # Load L fp8 tile (BLOCK_N, RANK)
     l_mask = (offs_n[:, None] < N) & (offs_r[None, :] < RANK)
     l_fp8 = tl.load(
@@ -891,11 +888,11 @@ def loraq_fused_q8_kernel(
     )   # (BLOCK_N, RANK) — each element carries its group's scale
 
     # Dequant L to fp16:  fp8_val × 2^(scale - 127)
-    l_fp16 = (l_fp8.to(tl.float32)
-              * tl.exp2((l_scale.to(tl.float32) - 127.0))).to(tl.float16)
+    l_fp16 = (l_fp8
+              * tl.exp2((l_scale - 127.0))).to(tl.float16)   # (BLOCK_N, RANK)
 
     # Single dot: (BLOCK_M, RANK) @ (RANK, BLOCK_N) → (BLOCK_M, BLOCK_N)
-    acc_lr = tl.dot(p_fp16, tl.trans(l_fp16)).to(tl.float32)
+    acc_lr = tl.dot(acc_p.to(tl.float16), tl.trans(l_fp16), out_dtype=tl.float32)
 
     # ===== Phase 3 — Sum + bias + channel-wise scaling + MXFP8 quant ========
 
@@ -909,8 +906,8 @@ def loraq_fused_q8_kernel(
     cs = tl.load(
         channel_scale_ptr + offs_n * stride_cs,
         mask=offs_n < N, other=1.0,
-    ).to(tl.float32)                                    # (BLOCK_N,)
-    result = result * cs[None, :]                       # (BLOCK_M, BLOCK_N)
+    )                                    # (BLOCK_N,)
+    result = result.to(tl.float16) * cs[None, :]                       # (BLOCK_M, BLOCK_N)
 
     # ---- group-wise MXFP8 quantization ----
     N_GROUPS: tl.constexpr = BLOCK_N // SCALE_GROUP
@@ -975,6 +972,8 @@ def loraq_fused_q8_kernel(
         C_scale_ptr + offs_m[:, None] * stride_csm + offs_ng[None, :] * stride_csn,
         scale_e8m0, mask=s_mask,
     )
+
+
 
 # ===========================================================================
 # Kernel 8 -- LoRaQ (FP8 variant): Phase 2 uses dot_scaled("e4m3","e4m3")
