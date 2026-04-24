@@ -1,7 +1,7 @@
 """
 Triton matrix multiplication kernels for fast_loraq.
 
-Eight kernels:
+Eleven kernels:
   1. matmul_kernel                       -- basic fp16/bf16 tiled GEMM
   2. matmul_fp4_kernel                   -- MXFP4 (e2m1) GEMM using tl.dot_scaled
   3. _mxfp4_quant_kernel                 -- fp16/bf16 -> packed e2m1 + e8m0 quantiser
@@ -10,6 +10,10 @@ Eight kernels:
   6. loraq_dual_gemm_kernel              -- fused P @ L^T + Q(A) @ Q(W)^T dual GEMM
   7. loraq_fused_q8_kernel               -- fused FP8/FP4 LoRA+Q, Phase 2 = tl.dot fp16
   8. loraq_fused_q8_scaled_kernel        -- fused FP8/FP4 LoRA+Q, Phase 2 = dot_scaled fp8
+  9. loraq_fused_fp16io_kernel           -- LoRaQ.3: fp16 in (fused quant), fp16 out
+ 10. loraq_split_proj_kernel             -- LoRaQ.4 K_proj: A_fp8 @ R_fp8^T → P_fp16
+ 11. loraq_split_main_kernel             -- LoRaQ.4 K_main: P×L^T + A×W^T → C_fp8
+ 12. loraq_fused_q8_perkiter_kernel      -- LoRaQ.5: per-K-iter correction (no acc_p)
 """
 
 import triton
@@ -423,21 +427,21 @@ def loraq_project_and_quant_kernel(
     P_ptr,          # (M, RANK) fp16 projection result  = A @ R^T
     A_fp4_ptr,      # (M, K // 2) uint8 packed e2m1    = Q(A) data
     A_scale_ptr,    # (M, K // 32) uint8 e8m0           = Q(A) scales
-    # Dimensions
-    M,              # number of rows in A
-    K,              # number of columns in A (== number of columns in R)
+    # Dimensions (constexpr for full compile-time optimization)
+    M: tl.constexpr,              # number of rows in A
+    K: tl.constexpr,              # number of columns in A (== number of columns in R)
     # Strides for A (M, K)
-    stride_am, stride_ak,
+    stride_am: tl.constexpr, stride_ak: tl.constexpr,
     # Strides for R (RANK, K)
-    stride_rr, stride_rk,
+    stride_rr: tl.constexpr, stride_rk: tl.constexpr,
     # Strides for P (M, RANK)
-    stride_pm, stride_pr,
+    stride_pm: tl.constexpr, stride_pr: tl.constexpr,
     # Strides for A_fp4 (M, K // 2)
-    stride_fp4_m, stride_fp4_n,
+    stride_fp4_m: tl.constexpr, stride_fp4_n: tl.constexpr,
     # Strides for A_scale (M, K // 32)
-    stride_sm, stride_sn,
+    stride_sm: tl.constexpr, stride_sn: tl.constexpr,
     # Stride for channel_scale (K,)
-    stride_cs,
+    stride_cs: tl.constexpr,
     # Compile-time constants
     RANK: tl.constexpr,         # fixed at 32
     BLOCK_M: tl.constexpr,      # rows per program
@@ -459,6 +463,10 @@ def loraq_project_and_quant_kernel(
     loads a ``(BLOCK_M, 32)`` tile of A.  That same tile is used for:
       - one rank-32 outer-product update  ``acc_p += a_tile @ r_tile^T``
       - one complete 32-element quantisation group
+
+    All dimensions and strides are constexpr for full compile-time
+    optimization (loop unrolling, address arithmetic, dead code elimination).
+    Recompiles per unique (M, K) shape.
 
     Grid: ``(ceil(M / BLOCK_M),)``  -- 1-D, one program per row-block.
     """
@@ -574,22 +582,22 @@ def loraq_dual_gemm_kernel(
     W_scale_ptr,    # (N, K // 32) uint8 e8m0         **scale by output channel**
     # Output
     C_ptr,          # (M, N) output
-    # Dimensions
-    M, N, K,
+    # Dimensions (constexpr for full compile-time optimization)
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
     # Strides for P (M, RANK)
-    stride_pm, stride_pr,
+    stride_pm: tl.constexpr, stride_pr: tl.constexpr,
     # Strides for L (N, RANK)
-    stride_ln, stride_lr,
+    stride_ln: tl.constexpr, stride_lr: tl.constexpr,
     # Strides for A_fp4 (M, K // 2)
-    stride_afm, stride_afk,
+    stride_afm: tl.constexpr, stride_afk: tl.constexpr,
     # Strides for A_scale (M, K // 32)
-    stride_asm, stride_ask,
+    stride_asm: tl.constexpr, stride_ask: tl.constexpr,
     # Strides for W_fp4 (K // 2, N)
-    stride_wfk, stride_wfn,
+    stride_wfk: tl.constexpr, stride_wfn: tl.constexpr,
     # Strides for W_scale (N, K // 32)
-    stride_wsn, stride_wsk,
+    stride_wsn: tl.constexpr, stride_wsk: tl.constexpr,
     # Strides for C (M, N)
-    stride_cm, stride_cn,
+    stride_cm: tl.constexpr, stride_cn: tl.constexpr,
     # Compile-time constants
     RANK: tl.constexpr,         # 32
     BLOCK_M: tl.constexpr,
@@ -612,6 +620,10 @@ def loraq_dual_gemm_kernel(
     format, looping over K in steps of BLOCK_K (>=64).
 
     Both accumulators (fp32) are summed before the final store.
+
+    All dimensions and strides are constexpr for full compile-time
+    optimization (loop unrolling, address arithmetic, dead code elimination).
+    Recompiles per unique (M, N, K) shape.
 
     Grid: ``(ceil(M / BLOCK_M) * ceil(N / BLOCK_N),)`` with L2 swizzle.
     """
@@ -807,7 +819,7 @@ def loraq_fused_q8_kernel(
     # ===== Phase 1 — Fused K-loop  (A×R^T  and  A×W^T) =====================
 
     acc_p = tl.zeros((BLOCK_M, RANK), dtype=tl.float32)     # A @ R^T
-    acc_q = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)  # A @ W^T
+    result = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)  # A @ W^T
 
     loop_k = tl.cdiv(K, BLOCK_K)
 
@@ -863,9 +875,9 @@ def loraq_fused_q8_kernel(
             other=0,
         )
 
-        acc_q = tl.dot_scaled(a_tile, a_scale, "e4m3",
+        result = tl.dot_scaled(a_tile, a_scale, "e4m3",
                                w_tile, w_scale, "e2m1",
-                               acc=acc_q, out_dtype=tl.float32)
+                               acc=result, out_dtype=tl.float32)
 
     # ===== Phase 2 — P × L^T  (fp16 × dequant-fp8→fp16) ====================
 
@@ -892,11 +904,10 @@ def loraq_fused_q8_kernel(
               * tl.exp2((l_scale - 127.0))).to(tl.float16)   # (BLOCK_N, RANK)
 
     # Single dot: (BLOCK_M, RANK) @ (RANK, BLOCK_N) → (BLOCK_M, BLOCK_N)
-    acc_lr = tl.dot(acc_p.to(tl.float16), tl.trans(l_fp16), out_dtype=tl.float32)
+    result = tl.dot(acc_p.to(tl.float16), tl.trans(l_fp16), acc=result,out_dtype=tl.float32)
 
     # ===== Phase 3 — Sum + bias + channel-wise scaling + MXFP8 quant ========
 
-    result = acc_lr + acc_q     # (BLOCK_M, BLOCK_N) fp32
 
     if HAS_BIAS:
         bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
@@ -935,34 +946,13 @@ def loraq_fused_q8_kernel(
     qx = tl.reshape(qx_3d, [BLOCK_M, BLOCK_N])
     qx = tl.clamp(qx, min=-448.0, max=448.0)
 
-    # ---- fp32 → fp8 e4m3  bit manipulation  (identical to _mxfp8_quant) ----
-    qx_u = qx.to(tl.uint32, bitcast=True)
-    s = qx_u & 0x80000000
-    e = (qx_u >> 23) & 0xFF
-    m = qx_u & 0x7FFFFF
-
-    E8_BIAS: tl.constexpr = 127
-    E4_BIAS: tl.constexpr = 7
-
-    adj = tl.core.sub(E8_BIAS - E4_BIAS, e, sanitize_overflow=False)
-    subnormal_m = (0x800000 | m) >> (adj + 1)
-    m = tl.where(e < (E8_BIAS - E4_BIAS), subnormal_m, m)
-    e = tl.where(e < (E8_BIAS - E4_BIAS), 0, e - (E8_BIAS - E4_BIAS))
-
-    round_bit = (m >> 19) & 1
-    m3 = (m >> 20) + round_bit
-    e = e + (m3 >> 3)
-    m3 = m3 & 0x7
-    e = tl.minimum(e, 15)
-    m3 = tl.where(e >= 15, tl.minimum(m3, 0x6), m3)
-
-    fp8_packed = ((s >> 24) | (e << 3) | m3).to(tl.uint8)
+    fp8_out = qx.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
 
     # ---- store fp8 data (BLOCK_M, BLOCK_N) ----
     c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     tl.store(
         C_fp8_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
-        fp8_packed, mask=c_mask,
+        fp8_out, mask=c_mask,
     )
 
     # ---- store e8m0 scales (BLOCK_M, N_GROUPS) ----
@@ -972,7 +962,6 @@ def loraq_fused_q8_kernel(
         C_scale_ptr + offs_m[:, None] * stride_csm + offs_ng[None, :] * stride_csn,
         scale_e8m0, mask=s_mask,
     )
-
 
 
 # ===========================================================================
@@ -1004,27 +993,27 @@ def loraq_fused_q8_scaled_kernel(
     # ---- dimensions (runtime — constexpr causes MLIR crash for this kernel) ----
     M, N, K,
     # ---- strides: A_fp8 (M, K) ----
-    stride_am, stride_ak,
+    stride_am: tl.constexpr, stride_ak: tl.constexpr,
     # ---- strides: A_scale (M, K//32) ----
-    stride_asm, stride_ask,
+    stride_asm: tl.constexpr, stride_ask: tl.constexpr,
     # ---- strides: R_fp8 (RANK, K) ----
-    stride_rr, stride_rk,
+    stride_rr: tl.constexpr, stride_rk: tl.constexpr,
     # ---- strides: R_scale (RANK, K//32) ----
-    stride_rsr, stride_rsk,
+    stride_rsr: tl.constexpr, stride_rsk: tl.constexpr,
     # ---- strides: L_fp8 (N, RANK) ----
-    stride_ln, stride_lr,
+    stride_ln: tl.constexpr, stride_lr: tl.constexpr,
     # ---- strides: L_scale (N, RANK//32) ----
-    stride_lsn, stride_lsk,
+    stride_lsn: tl.constexpr, stride_lsk: tl.constexpr,
     # ---- strides: W_fp4 (K//2, N) ----
-    stride_wk, stride_wn,
+    stride_wk: tl.constexpr, stride_wn: tl.constexpr,
     # ---- strides: W_scale (N, K//32) ----
-    stride_wsn, stride_wsk,
+    stride_wsn: tl.constexpr, stride_wsk: tl.constexpr,
     # ---- strides: C_fp8 (M, N) ----
-    stride_cm, stride_cn,
+    stride_cm: tl.constexpr, stride_cn: tl.constexpr,
     # ---- strides: C_scale (M, N//32) ----
-    stride_csm, stride_csn,
+    stride_csm: tl.constexpr, stride_csn: tl.constexpr,
     # ---- stride: channel_scale (N,) ----
-    stride_cs,
+    stride_cs: tl.constexpr,
     # ---- compile-time constants ----
     HAS_BIAS: tl.constexpr,
     RANK: tl.constexpr,            # 64
@@ -1054,9 +1043,10 @@ def loraq_fused_q8_scaled_kernel(
 
     Phases 1 and 3 are identical to Kernel 7.
 
-    NOTE: dimensions and strides are runtime (not constexpr) because the
-    in-register MXFP8 quantization in Phase 2 causes an MLIR compiler
+    NOTE: M, N, K are kept as runtime parameters (not constexpr) because
+    the in-register MXFP8 quantization in Phase 2 causes an MLIR compiler
     crash (ConvertTritonAMDGPUToLLVM) when combined with constexpr dims.
+    Strides are constexpr for address arithmetic folding.
 
     Grid: (ceil(M/BLOCK_M) * ceil(N/BLOCK_N),)
     """
@@ -1157,27 +1147,8 @@ def loraq_fused_q8_scaled_kernel(
     qp_3d = p_3d * p_quant_3d
     qp = tl.reshape(qp_3d, [BLOCK_M, RANK])
     qp = tl.clamp(qp, min=-448.0, max=448.0)
-
-    # fp32 → fp8 bit manipulation (same as _mxfp8_quant_kernel)
-    qp_u = qp.to(tl.uint32, bitcast=True)
-    sp = qp_u & 0x80000000
-    ep = (qp_u >> 23) & 0xFF
-    mp = qp_u & 0x7FFFFF
-
-    adj_p = tl.core.sub(E8_BIAS - E4_BIAS, ep, sanitize_overflow=False)
-    sub_mp = (0x800000 | mp) >> (adj_p + 1)
-    mp = tl.where(ep < (E8_BIAS - E4_BIAS), sub_mp, mp)
-    ep = tl.where(ep < (E8_BIAS - E4_BIAS), 0, ep - (E8_BIAS - E4_BIAS))
-
-    rb_p = (mp >> 19) & 1
-    m3p = (mp >> 20) + rb_p
-    ep = ep + (m3p >> 3)
-    m3p = m3p & 0x7
-    ep = tl.minimum(ep, 15)
-    m3p = tl.where(ep >= 15, tl.minimum(m3p, 0x6), m3p)
-
-    p_fp8 = ((sp >> 24) | (ep << 3) | m3p).to(tl.uint8)  # (BLOCK_M, RANK)
-
+    p_fp8 = qp.to(tl.float8e4nv)  # (BLOCK_M, RANK) in fp8 format, still as float32
+    
     # ---- Load L as (RANK, BLOCK_N) via transposed indexing ----
     l_tile = tl.load(
         L_fp8_ptr + offs_n[None, :] * stride_ln + offs_r[:, None] * stride_lr,
@@ -1232,25 +1203,8 @@ def loraq_fused_q8_scaled_kernel(
     qx_3d = result_3d * quant_scale_3d
     qx = tl.reshape(qx_3d, [BLOCK_M, BLOCK_N])
     qx = tl.clamp(qx, min=-448.0, max=448.0)
-
-    qx_u = qx.to(tl.uint32, bitcast=True)
-    s = qx_u & 0x80000000
-    e = (qx_u >> 23) & 0xFF
-    m = qx_u & 0x7FFFFF
-
-    adj = tl.core.sub(E8_BIAS - E4_BIAS, e, sanitize_overflow=False)
-    subnormal_m = (0x800000 | m) >> (adj + 1)
-    m = tl.where(e < (E8_BIAS - E4_BIAS), subnormal_m, m)
-    e = tl.where(e < (E8_BIAS - E4_BIAS), 0, e - (E8_BIAS - E4_BIAS))
-
-    round_bit = (m >> 19) & 1
-    m3 = (m >> 20) + round_bit
-    e = e + (m3 >> 3)
-    m3 = m3 & 0x7
-    e = tl.minimum(e, 15)
-    m3 = tl.where(e >= 15, tl.minimum(m3, 0x6), m3)
-
-    fp8_packed = ((s >> 24) | (e << 3) | m3).to(tl.uint8)
+    
+    fp8_packed = qx.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
 
     c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     tl.store(

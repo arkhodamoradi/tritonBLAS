@@ -11,6 +11,8 @@ TritonLinearFP4   : MXFP4 e2m1 linear layer   (4-bit weight + online input quant
 TritonLinearLoRA  : LoRA+Q layer  (low-rank correction + MXFP4 weight)
 TritonLinearLoRaQ    : Fused FP8/FP4 LoRA+Q layer, Phase 2 = tl.dot fp16
 TritonLinearLoRaQFP8 : Fused FP8/FP4 LoRA+Q layer, Phase 2 = dot_scaled fp8
+TritonLinearLoRaQ3   : LoRaQ.3 — fp16 in (fused quant), fp16 out
+TritonLinearLoRaQ4   : LoRaQ.4 — split K_proj + K_main (lower register pressure)
 """
 
 import torch
@@ -23,7 +25,7 @@ from loraq.kernels import (
     loraq_project_and_quant_kernel,
     loraq_dual_gemm_kernel,
     loraq_fused_q8_kernel,
-    loraq_fused_q8_scaled_kernel,
+    loraq_fused_q8_scaled_kernel
 )
 from loraq.quant import (
     dynamic_mxfp4_quant,
@@ -34,6 +36,8 @@ from loraq.quant import (
 )
 from loraq.autotune_configs import (
     AutotunedLoRaQ,
+    AutotunedLoRaQProj,
+    AutotunedLoRaQMain,
     AutotunedDualGEMM,
     AutotunedProjectAndQuant,
     LORAQ_Q8_CONFIGS,
