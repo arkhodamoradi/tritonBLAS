@@ -692,6 +692,7 @@ def loraq_dual_gemm_kernel(
     tl.store(C_ptrs, c, mask=c_mask)
 
 
+
 # ===========================================================================
 # Kernel 7 -- LoRaQ: fused FP8/FP4 LoRA+Q with MXFP8 output
 #   C_fp8 = q8( fp16(q8(A) @ q8(R)^T) @ fp16(q8(L))^T  +  q8(A) @ q4(W)^T )
@@ -954,10 +955,13 @@ def loraq_fused_q8_kernel(
     )
 
 
-
 # ===========================================================================
-# Kernel 8 -- LoRaQ (FP8 variant): Phase 2 uses dot_scaled("e4m3","e4m3")
+# Kernel 8 -- LoRaQ (FP8 variant): Phase 2 uses dot_scaled("e4m3","e4m3").
 #   C_fp8 = q8( q8(q8(A) @ q8(R)^T) @ q8(L)^T  +  q8(A) @ q4(W)^T )
+#
+#   All dims and strides are constexpr — K-loop is fully unrolled and
+#   software-pipelined.  waves_per_eu is tunable via the autotuner sweep
+#   and passed at launch time (no change needed in the kernel signature).
 # ===========================================================================
 
 @triton.jit
@@ -981,40 +985,40 @@ def loraq_fused_q8_scaled_kernel(
     # ---- outputs ----
     C_fp8_ptr,          # (M, N)     uint8  (will be viewed as float8_e4m3fn)
     C_scale_ptr,        # (M, N//32) uint8 e8m0
-    # ---- dimensions (runtime — constexpr causes MLIR crash for this kernel) ----
-    M, N, K,
+    # ---- dimensions (crashes for Triton 3.5 or lower) ----
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
     # ---- strides: A_fp8 (M, K) ----
-    stride_am, stride_ak,
+    stride_am: tl.constexpr, stride_ak: tl.constexpr,
     # ---- strides: A_scale (M, K//32) ----
-    stride_asm, stride_ask,
+    stride_asm: tl.constexpr, stride_ask: tl.constexpr,
     # ---- strides: R_fp8 (RANK, K) ----
-    stride_rr, stride_rk,
+    stride_rr: tl.constexpr, stride_rk: tl.constexpr,
     # ---- strides: R_scale (RANK, K//32) ----
-    stride_rsr, stride_rsk,
+    stride_rsr: tl.constexpr, stride_rsk: tl.constexpr,
     # ---- strides: L_fp8 (N, RANK) ----
-    stride_ln, stride_lr,
+    stride_ln: tl.constexpr, stride_lr: tl.constexpr,
     # ---- strides: L_scale (N, RANK//32) ----
-    stride_lsn, stride_lsk,
+    stride_lsn: tl.constexpr, stride_lsk: tl.constexpr,
     # ---- strides: W_fp4 (K//2, N) ----
-    stride_wk, stride_wn,
+    stride_wk: tl.constexpr, stride_wn: tl.constexpr,
     # ---- strides: W_scale (N, K//32) ----
-    stride_wsn, stride_wsk,
+    stride_wsn: tl.constexpr, stride_wsk: tl.constexpr,
     # ---- strides: C_fp8 (M, N) ----
-    stride_cm, stride_cn,
+    stride_cm: tl.constexpr, stride_cn: tl.constexpr,
     # ---- strides: C_scale (M, N//32) ----
-    stride_csm, stride_csn,
+    stride_csm: tl.constexpr, stride_csn: tl.constexpr,
     # ---- stride: channel_scale (N,) ----
-    stride_cs,
+    stride_cs: tl.constexpr,
     # ---- compile-time constants ----
     HAS_BIAS: tl.constexpr,
-    RANK: tl.constexpr,            # 64
-    BLOCK_M: tl.constexpr,         # 128
-    BLOCK_N: tl.constexpr,         # 128
-    BLOCK_K: tl.constexpr,         # 64
-    GROUP_SIZE_M: tl.constexpr,    # 8
+    RANK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
     """
-    Fused kernel computing (fully-fp8 Phase 2 variant):
+    Fused kernel computing (fully-fp8 Phase 2, constexpr dims):
 
         C_fp8 = MXFP8_quant(
             channel_scale * (
@@ -1024,33 +1028,26 @@ def loraq_fused_q8_scaled_kernel(
             )
         )
 
-    Identical to ``loraq_fused_q8_kernel`` (Kernel 7) except Phase 2:
+    Identical to loraq_fused_q8_kernel (K7) except Phase 2 uses
+    dot_scaled("e4m3","e4m3") with P quantized to MXFP8 in-register.
 
-    Phase 2  P × L^T — P is quantized to MXFP8 in-register (fp32→fp8),
-             then dot_scaled("e4m3","e4m3") is used.  This trades some
-             precision (extra P quantization) for potentially higher
-             throughput via the hardware-accelerated scaled-dot path.
-             RANK=64 satisfies the K≥64 requirement for dot_scaled.
-
-    Phases 1 and 3 are identical to Kernel 7.
-
-    NOTE: dimensions and strides are runtime (not constexpr) because the
-    in-register MXFP8 quantization in Phase 2 causes an MLIR compiler
-    crash (ConvertTritonAMDGPUToLLVM) when combined with constexpr dims.
+    All dims and strides are constexpr — the K-loop is fully unrolled and
+    software-pipelined by the compiler.  waves_per_eu is swept by the
+    autotuner at launch time (no kernel-level change required).
 
     Grid: (ceil(M/BLOCK_M) * ceil(N/BLOCK_N),)
     """
     SCALE_GROUP: tl.constexpr = 32
+    RANK_GROUPS: tl.constexpr = RANK // SCALE_GROUP   # 64 // 32 = 2
 
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
 
-    # L2-friendly grouped swizzle
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    group_id        = pid // num_pid_in_group
+    first_pid_m     = group_id * GROUP_SIZE_M
+    group_size_m    = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
@@ -1062,20 +1059,17 @@ def loraq_fused_q8_scaled_kernel(
     rn = offs_n % N
 
     # ===== Phase 1 — Fused K-loop  (A×R^T  and  A×W^T) =====================
-    # (identical to Kernel 7)
-
     acc_p = tl.zeros((BLOCK_M, RANK), dtype=tl.float32)
     acc_q = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     loop_k = tl.cdiv(K, BLOCK_K)
 
     for k in range(0, loop_k):
-        k0 = k * BLOCK_K
-        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k0      = k * BLOCK_K
+        offs_k  = k0 + tl.arange(0, BLOCK_K)
         offs_kg = (k0 // SCALE_GROUP) + tl.arange(0, BLOCK_K // SCALE_GROUP)
-        
-        s_mask = offs_kg[None, :] < (K // SCALE_GROUP)
-        
+        s_mask  = offs_kg[None, :] < (K // SCALE_GROUP)
+
         a_tile = tl.load(
             A_fp8_ptr + rm[:, None] * stride_am + offs_k[None, :] * stride_ak,
             mask=offs_k[None, :] < K, other=0.0,
@@ -1094,8 +1088,8 @@ def loraq_fused_q8_scaled_kernel(
             mask=s_mask, other=0,
         )
         acc_p = tl.dot_scaled(a_tile, a_scale, "e4m3",
-                               r_tile, r_scale, "e4m3",
-                               acc=acc_p, out_dtype=tl.float32)
+                              r_tile, r_scale, "e4m3",
+                              acc=acc_p, out_dtype=tl.float32)
 
         offs_k_packed = (k0 // 2) + tl.arange(0, BLOCK_K // 2)
         w_tile = tl.load(
@@ -1107,98 +1101,71 @@ def loraq_fused_q8_scaled_kernel(
             mask=s_mask, other=0,
         )
         acc_q = tl.dot_scaled(a_tile, a_scale, "e4m3",
-                               w_tile, w_scale, "e2m1",
-                               acc=acc_q, out_dtype=tl.float32)
+                              w_tile, w_scale, "e2m1",
+                              acc=acc_q, out_dtype=tl.float32)
 
     # ===== Phase 2 — P × L^T  via dot_scaled("e4m3","e4m3") ================
-    #
-    # Key difference from Kernel 7: P is quantized to MXFP8 in-register,
-    # then dot_scaled is used instead of tl.dot with fp16.
-
-    RANK_GROUPS: tl.constexpr = RANK // SCALE_GROUP   # 64 // 32 = 2
-    E8_BIAS: tl.constexpr = 127
-    E4_BIAS: tl.constexpr = 7
-
-    # ---- In-register MXFP8 quantisation of P (BLOCK_M, RANK) ----
-    # Compute per-group scales for P
-    p_3d = tl.reshape(acc_p, [BLOCK_M, RANK_GROUPS, SCALE_GROUP])
-    p_amax = tl.max(tl.abs(p_3d), axis=2)              # (BLOCK_M, RANK_GROUPS)
+    p_3d   = tl.reshape(acc_p, [BLOCK_M, RANK_GROUPS, SCALE_GROUP])
+    p_amax = tl.max(tl.abs(p_3d), axis=2)
 
     p_amax_i = p_amax.to(tl.int32, bitcast=True)
     p_amax_i = (p_amax_i + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
-    p_amax = p_amax_i.to(tl.float32, bitcast=True)
+    p_amax   = p_amax_i.to(tl.float32, bitcast=True)
 
-    p_scale_exp = tl.log2(p_amax).floor() - 7
-    p_scale_exp = tl.clamp(p_scale_exp, min=-127, max=127)
-    p_scale_e8m0 = p_scale_exp.to(tl.uint8) + 127      # (BLOCK_M, RANK_GROUPS)
+    p_scale_exp  = tl.log2(p_amax).floor() - 7
+    p_scale_exp  = tl.clamp(p_scale_exp, min=-127, max=127)
+    p_scale_e8m0 = p_scale_exp.to(tl.uint8) + 127
 
-    # Normalize P into fp8 range and convert using native .to()
-    p_quant = tl.exp2(-p_scale_exp)                     # (BLOCK_M, RANK_GROUPS)
+    p_quant    = tl.exp2(-p_scale_exp)
     p_quant_3d = tl.reshape(p_quant, [BLOCK_M, RANK_GROUPS, 1])
+    qp_3d      = p_3d * p_quant_3d
+    qp         = tl.reshape(qp_3d, [BLOCK_M, RANK])
+    qp         = tl.clamp(qp, min=-448.0, max=448.0)
+    p_fp8      = qp.to(tl.float8e4nv)
 
-    qp_3d = p_3d * p_quant_3d
-    qp = tl.reshape(qp_3d, [BLOCK_M, RANK])
-    qp = tl.clamp(qp, min=-448.0, max=448.0)
-
-    # Use native Triton .to() conversion for fp32 → fp8
-    p_fp8 = qp.to(tl.float8e4nv)  # (BLOCK_M, RANK)
-
-    # ---- Load L as (RANK, BLOCK_N) via transposed indexing ----
     l_tile = tl.load(
         L_fp8_ptr + offs_n[None, :] * stride_ln + offs_r[:, None] * stride_lr,
-        mask=(offs_n[None, :] < N) & (offs_r[:, None] < RANK),
-        other=0.0,
-    )   # (RANK, BLOCK_N)
-
-    # ---- Load L scale as (BLOCK_N, RANK//32) = (BLOCK_N, 2) ----
+        mask=(offs_n[None, :] < N) & (offs_r[:, None] < RANK), other=0.0,
+    )
     offs_rk = tl.arange(0, RANK_GROUPS)
     l_scale = tl.load(
         L_scale_ptr + offs_n[:, None] * stride_lsn + offs_rk[None, :] * stride_lsk,
-        mask=offs_n[:, None] < N,
-        other=0,
-    )   # (BLOCK_N, RANK_GROUPS)
+        mask=offs_n[:, None] < N, other=0,
+    )
 
-    # ---- dot_scaled: (BLOCK_M, RANK) × (RANK, BLOCK_N) → (BLOCK_M, BLOCK_N) ----
     result = tl.dot_scaled(p_fp8, p_scale_e8m0, "e4m3",
                            l_tile, l_scale, "e4m3", acc=acc_q)
 
-    # ===== Phase 3 — Sum + bias + channel-wise scaling + MXFP8 quant ========
-    # (identical to Kernel 7)
-
-    # result = acc_lr + acc_q
-
+    # ===== Phase 3 — bias + channel-wise scaling + MXFP8 quant ==============
     if HAS_BIAS:
         bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
         result = result + bias[None, :]
 
-    # ---- channel-wise pre-scaling before quantization ----
+    N_GROUPS: tl.constexpr = BLOCK_N // SCALE_GROUP
+
     cs = tl.load(
         channel_scale_ptr + offs_n * stride_cs,
         mask=offs_n < N, other=1.0,
-    ).to(tl.float32)                                    # (BLOCK_N,)
-    result = result * cs[None, :]                       # (BLOCK_M, BLOCK_N)
-
-    N_GROUPS: tl.constexpr = BLOCK_N // SCALE_GROUP
+    ).to(tl.float32)
+    result = result * cs[None, :]
 
     result_3d = tl.reshape(result, [BLOCK_M, N_GROUPS, SCALE_GROUP])
-    amax = tl.max(tl.abs(result_3d), axis=2)
+    amax      = tl.max(tl.abs(result_3d), axis=2)
 
     amax_i = amax.to(tl.int32, bitcast=True)
     amax_i = (amax_i + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
-    amax = amax_i.to(tl.float32, bitcast=True)
+    amax   = amax_i.to(tl.float32, bitcast=True)
 
-    scale_exp = tl.log2(amax).floor() - 7
-    scale_exp = tl.clamp(scale_exp, min=-127, max=127)
+    scale_exp  = tl.log2(amax).floor() - 7
+    scale_exp  = tl.clamp(scale_exp, min=-127, max=127)
     scale_e8m0 = scale_exp.to(tl.uint8) + 127
 
-    quant_scale = tl.exp2(-scale_exp)
+    quant_scale    = tl.exp2(-scale_exp)
     quant_scale_3d = tl.reshape(quant_scale, [BLOCK_M, N_GROUPS, 1])
+    qx_3d          = result_3d * quant_scale_3d
+    qx             = tl.reshape(qx_3d, [BLOCK_M, BLOCK_N])
+    qx             = tl.clamp(qx, min=-448.0, max=448.0)
 
-    qx_3d = result_3d * quant_scale_3d
-    qx = tl.reshape(qx_3d, [BLOCK_M, BLOCK_N])
-    qx = tl.clamp(qx, min=-448.0, max=448.0)
-
-    # Use native Triton .to() conversion for fp32 → fp8, then bitcast to uint8 for storage
     fp8_out = qx.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
 
     c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
@@ -1208,7 +1175,7 @@ def loraq_fused_q8_scaled_kernel(
     )
 
     offs_ng = pid_n * N_GROUPS + tl.arange(0, N_GROUPS)
-    s_mask = (offs_m[:, None] < M) & (offs_ng[None, :] < (N // SCALE_GROUP))
+    s_mask  = (offs_m[:, None] < M) & (offs_ng[None, :] < (N // SCALE_GROUP))
     tl.store(
         C_scale_ptr + offs_m[:, None] * stride_csm + offs_ng[None, :] * stride_csn,
         scale_e8m0, mask=s_mask,
