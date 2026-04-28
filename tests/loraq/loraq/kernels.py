@@ -966,6 +966,208 @@ def loraq_fused_q8_kernel(
 
 
 # ===========================================================================
+# Breakdown kernels for K8 path analysis
+# ===========================================================================
+
+# -- K_lowrank: fused low-rank branch (A×R^T → P quant → P×L^T → fp16 out) --
+
+@triton.jit
+def loraq_lowrank_branch_kernel(
+    A_fp8_ptr, A_scale_ptr,
+    R_fp8_ptr, R_scale_ptr,
+    L_fp8_ptr, L_scale_ptr,
+    C_ptr,  # (M, N) fp16 output
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    stride_am: tl.constexpr, stride_ak: tl.constexpr,
+    stride_asm: tl.constexpr, stride_ask: tl.constexpr,
+    stride_rr: tl.constexpr, stride_rk: tl.constexpr,
+    stride_rsr: tl.constexpr, stride_rsk: tl.constexpr,
+    stride_ln: tl.constexpr, stride_lr: tl.constexpr,
+    stride_lsn: tl.constexpr, stride_lsk: tl.constexpr,
+    stride_cm: tl.constexpr, stride_cn: tl.constexpr,
+    RANK: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """Low-rank branch only: A_fp8×R_fp8^T → P → quant(P) → P_fp8×L_fp8^T → fp16."""
+    SCALE_GROUP: tl.constexpr = 32
+    RANK_GROUPS: tl.constexpr = RANK // SCALE_GROUP
+
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_r = tl.arange(0, RANK)
+    rm = offs_m % M
+
+    # Phase 1: A × R^T via dot_scaled
+    acc_p = tl.zeros((BLOCK_M, RANK), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        k0 = k * BLOCK_K
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        offs_kg = (k0 // SCALE_GROUP) + tl.arange(0, BLOCK_K // SCALE_GROUP)
+
+        a_tile = tl.load(A_fp8_ptr + rm[:, None] * stride_am + offs_k[None, :] * stride_ak,
+                         mask=offs_k[None, :] < K, other=0.0)
+        a_scale = tl.load(A_scale_ptr + rm[:, None] * stride_asm + offs_kg[None, :] * stride_ask,
+                          mask=offs_kg[None, :] < (K // SCALE_GROUP), other=0)
+        r_tile = tl.load(R_fp8_ptr + offs_r[None, :] * stride_rr + offs_k[:, None] * stride_rk,
+                         mask=offs_k[:, None] < K, other=0.0)
+        r_scale = tl.load(R_scale_ptr + offs_r[:, None] * stride_rsr + offs_kg[None, :] * stride_rsk,
+                          mask=offs_kg[None, :] < (K // SCALE_GROUP), other=0)
+        acc_p = tl.dot_scaled(a_tile, a_scale, "e4m3", r_tile, r_scale, "e4m3",
+                               acc=acc_p, out_dtype=tl.float32)
+
+    # Phase 2: In-register MXFP8 quant of P + P×L^T via dot_scaled
+    p_3d = tl.reshape(acc_p, [BLOCK_M, RANK_GROUPS, SCALE_GROUP])
+    p_amax = tl.max(tl.abs(p_3d), axis=2)
+    p_amax_i = p_amax.to(tl.int32, bitcast=True)
+    p_amax_i = (p_amax_i + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
+    p_amax = p_amax_i.to(tl.float32, bitcast=True)
+    p_scale_exp = tl.log2(p_amax).floor() - 7
+    p_scale_exp = tl.clamp(p_scale_exp, min=-127, max=127)
+    p_scale_e8m0 = p_scale_exp.to(tl.uint8) + 127
+    p_quant = tl.exp2(-p_scale_exp)
+    p_quant_3d = tl.reshape(p_quant, [BLOCK_M, RANK_GROUPS, 1])
+    qp_3d = p_3d * p_quant_3d
+    qp = tl.reshape(qp_3d, [BLOCK_M, RANK])
+    qp = tl.clamp(qp, min=-448.0, max=448.0)
+    p_fp8 = qp.to(tl.float8e4nv)
+
+    # Load L as (RANK, BLOCK_N) + scale
+    l_tile = tl.load(L_fp8_ptr + offs_n[None, :] * stride_ln + offs_r[:, None] * stride_lr,
+                     mask=(offs_n[None, :] < N) & (offs_r[:, None] < RANK), other=0.0)
+    offs_rk = tl.arange(0, RANK_GROUPS)
+    l_scale = tl.load(L_scale_ptr + offs_n[:, None] * stride_lsn + offs_rk[None, :] * stride_lsk,
+                      mask=offs_n[:, None] < N, other=0)
+
+    result = tl.dot_scaled(p_fp8, p_scale_e8m0, "e4m3", l_tile, l_scale, "e4m3")
+
+    # Store fp16
+    c = result.to(tl.float16)
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, c, mask=c_mask)
+
+
+# -- K_residual: standalone fp8×fp4 GEMM (A×W^T → fp16 out) --
+
+@triton.jit
+def loraq_residual_branch_kernel(
+    A_fp8_ptr, A_scale_ptr,
+    W_fp4_ptr, W_scale_ptr,
+    C_ptr,  # (M, N) fp16 output
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    stride_am: tl.constexpr, stride_ak: tl.constexpr,
+    stride_asm: tl.constexpr, stride_ask: tl.constexpr,
+    stride_wk: tl.constexpr, stride_wn: tl.constexpr,
+    stride_wsn: tl.constexpr, stride_wsk: tl.constexpr,
+    stride_cm: tl.constexpr, stride_cn: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """Standalone A_fp8 × W_fp4^T → fp16 output via dot_scaled(e4m3, e2m1)."""
+    SCALE_GROUP: tl.constexpr = 32
+
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rm = offs_m % M
+    rn = offs_n % N
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        k0 = k * BLOCK_K
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        offs_kg = (k0 // SCALE_GROUP) + tl.arange(0, BLOCK_K // SCALE_GROUP)
+
+        a_tile = tl.load(A_fp8_ptr + rm[:, None] * stride_am + offs_k[None, :] * stride_ak,
+                         mask=offs_k[None, :] < K, other=0.0)
+        a_scale = tl.load(A_scale_ptr + rm[:, None] * stride_asm + offs_kg[None, :] * stride_ask,
+                          mask=offs_kg[None, :] < (K // SCALE_GROUP), other=0)
+
+        offs_k_packed = (k0 // 2) + tl.arange(0, BLOCK_K // 2)
+        w_tile = tl.load(W_fp4_ptr + offs_k_packed[:, None] * stride_wk + rn[None, :] * stride_wn,
+                         mask=offs_k_packed[:, None] < (K // 2), other=0)
+        w_scale = tl.load(W_scale_ptr + rn[:, None] * stride_wsn + offs_kg[None, :] * stride_wsk,
+                          mask=offs_kg[None, :] < (K // SCALE_GROUP), other=0)
+
+        acc = tl.dot_scaled(a_tile, a_scale, "e4m3", w_tile, w_scale, "e2m1",
+                            acc=acc, out_dtype=tl.float32)
+
+    c = acc.to(tl.float16)
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, c, mask=c_mask)
+
+
+# -- K_sum_quant: fp16 add + MXFP8 output quant --
+
+@triton.jit
+def loraq_sum_quant_kernel(
+    A_ptr, B_ptr,  # (M, N) fp16 inputs
+    C_fp8_ptr, C_scale_ptr,  # MXFP8 output
+    M: tl.constexpr, N: tl.constexpr,
+    stride_am: tl.constexpr, stride_an: tl.constexpr,
+    stride_bm: tl.constexpr, stride_bn: tl.constexpr,
+    stride_cm: tl.constexpr, stride_cn: tl.constexpr,
+    stride_csm: tl.constexpr, stride_csn: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """Add two fp16 tensors + MXFP8 quantize the result."""
+    SCALE_GROUP: tl.constexpr = 32
+
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    a = tl.load(A_ptr + offs_m[:, None] * stride_am + offs_n[None, :] * stride_an, mask=mask, other=0.0)
+    b = tl.load(B_ptr + offs_m[:, None] * stride_bm + offs_n[None, :] * stride_bn, mask=mask, other=0.0)
+    result = (a + b).to(tl.float16)
+
+    # MXFP8 quant
+    N_GROUPS: tl.constexpr = BLOCK_N // SCALE_GROUP
+    result_3d = tl.reshape(result, [BLOCK_M, N_GROUPS, SCALE_GROUP])
+    amax = tl.max(tl.abs(result_3d), axis=2)
+    amax_i = amax.to(tl.int32, bitcast=True)
+    amax_i = (amax_i + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
+    amax = amax_i.to(tl.float32, bitcast=True)
+    scale_exp = tl.log2(amax).floor() - 7
+    scale_exp = tl.clamp(scale_exp, min=-127, max=127)
+    scale_e8m0 = scale_exp.to(tl.uint8) + 127
+    quant_scale = tl.exp2(-scale_exp)
+    quant_scale_3d = tl.reshape(quant_scale, [BLOCK_M, N_GROUPS, 1])
+    qx_3d = result_3d * quant_scale_3d
+    qx = tl.reshape(qx_3d, [BLOCK_M, BLOCK_N])
+    qx = tl.clamp(qx, min=-448.0, max=448.0)
+    fp8_out = qx.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+
+    tl.store(C_fp8_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, fp8_out, mask=mask)
+
+    offs_ng = pid_n * N_GROUPS + tl.arange(0, N_GROUPS)
+    s_mask = (offs_m[:, None] < M) & (offs_ng[None, :] < (N // SCALE_GROUP))
+    tl.store(C_scale_ptr + offs_m[:, None] * stride_csm + offs_ng[None, :] * stride_csn,
+             scale_e8m0, mask=s_mask)
+
+
+# ===========================================================================
 # Kernel 9 -- LoRaQ.7: like K7 but Phase 3 uses v_cvt_scalef32_pk_fp8_f16
 #   Hardware FP8 quantization via inline assembly (MI350 gfx950)
 # ===========================================================================

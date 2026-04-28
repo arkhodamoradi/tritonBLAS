@@ -422,14 +422,6 @@ def run_profile(M, K, N):
         r1["time_us"], r1["config"], r1["metadata"],
     )
 
-    # ---- LoRaQ.7 (K9 — HW quant) ----
-    print("  Profiling LoRaQ.7 (K9 — HW fp8 quant) ...")
-    r9 = profile_loraq_k9(M, K, N)
-    print_kernel_stats(
-        "LoRaQ.7 (K9 — HW v_cvt_scalef32_pk_fp8_f16)",
-        r9["time_us"], r9["config"], r9["metadata"],
-    )
-
     # ---- LoRaQ.2 ----
     print("  Profiling LoRaQ.2 (Kernel 8) ...")
     r2_loraq = profile_loraq2(M, K, N)
@@ -454,7 +446,6 @@ def run_profile(M, K, N):
     print(f"  {'─' * 60}")
     print(f"  Summary:")
     print(f"    LoRaQ.1 (K7):          {r1['time_us']:.1f} µs")
-    print(f"    LoRaQ.7 (K9 HW):      {r9['time_us']:.1f} µs")
     print(f"    LoRaQ.2 (K8):          {r2_loraq['time_us']:.1f} µs")
     print(f"    SVDQuant K5+K6 (e2e):  {r2['e2e_time_us']:.1f} µs")
 
@@ -467,13 +458,10 @@ def run_profile(M, K, N):
 
     print(f"    LoRaQ.1 / SVDQuant:   {ratio_v1:.2f}x {speedup_label(ratio_v1)}")
     print(f"    LoRaQ.2 / SVDQuant:   {ratio_v2:.2f}x {speedup_label(ratio_v2)}")
-    ratio_91 = r9["time_us"] / r1["time_us"] if r1["time_us"] > 0 else float("inf")
-    print(f"    LoRaQ.7 / LoRaQ.1:    {ratio_91:.2f}x {speedup_label(ratio_91)}")
     print(f"    LoRaQ.2 / LoRaQ.1:    {ratio_12:.2f}x {speedup_label(ratio_12)}")
 
     # Spill / scratch warnings
     for name, meta in [("LoRaQ.1 K7", r1["metadata"]),
-                        ("LoRaQ.7 K9", r9["metadata"]),
                         ("LoRaQ.2 K8", r2_loraq["metadata"]),
                         ("SVDQuant K5", r2["k5"]["metadata"]),
                         ("SVDQuant K6", r2["k6"]["metadata"])]:
@@ -498,6 +486,8 @@ def main():
                         metavar=("M", "K", "N"), help="Problem size")
     parser.add_argument("--all-sizes", action="store_true",
                         help="Profile multiple sizes")
+    parser.add_argument("--breakdown", action="store_true",
+                        help="K8 breakdown: profile each GEMM path separately")
     args = parser.parse_args()
 
     torch.manual_seed(42)
@@ -517,7 +507,130 @@ def main():
         if K % 64 != 0 or N % 32 != 0:
             print(f"  Skipping ({M}, {K}, {N}): K must be % 64, N must be % 32")
             continue
-        run_profile(M, K, N)
+        if args.breakdown:
+            run_k8_breakdown(M, K, N)
+        else:
+            run_profile(M, K, N)
+
+
+def run_k8_breakdown(M, K, N):
+    """Profile K8 split into 3 kernels: low-rank, residual, sum+quant."""
+    from loraq.kernels import (
+        loraq_lowrank_branch_kernel,
+        loraq_residual_branch_kernel,
+        loraq_sum_quant_kernel,
+    )
+
+    W = 90
+    print(f"\n{'=' * W}")
+    print(f"  K8 Path Breakdown: M={M}, K={K}, N={N}")
+    print(f"  3-kernel split: low-rank | residual | sum+quant")
+    print(f"{'=' * W}\n")
+
+    x = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    a_fp8, a_scale = dynamic_mxfp8_quant(x)
+    ref = nn.Linear(K, N, bias=False, device="cuda", dtype=torch.float16)
+    layer = TritonLinearLoRaQ.from_float(ref)
+    w_fp4_t = layer.weight_fp4.t().contiguous()
+    rank = 64
+    BM, BN, BK, GM = 128, 128, 64, 8
+
+    # Outputs
+    C_lr = torch.empty((M, N), dtype=torch.float16, device="cuda")
+    C_res = torch.empty((M, N), dtype=torch.float16, device="cuda")
+    C_fp8 = torch.empty((M, N), dtype=torch.uint8, device="cuda")
+    C_scale = torch.empty((M, N // 32), dtype=torch.uint8, device="cuda")
+
+    grid_mn = (triton.cdiv(M, BM) * triton.cdiv(N, BN),)
+
+    # ---- 1. Low-rank branch (fused: A×R^T → P quant → P×L^T → fp16) ----
+    print("  1. LOW-RANK BRANCH (fused kernel: A×R^T → quant(P) → P×L^T)")
+    def run_lowrank():
+        loraq_lowrank_branch_kernel[grid_mn](
+            a_fp8, a_scale, layer.R_fp8, layer.R_scale,
+            layer.L_fp8, layer.L_scale, C_lr,
+            M, N, K,
+            a_fp8.stride(0), a_fp8.stride(1),
+            a_scale.stride(0), a_scale.stride(1),
+            layer.R_fp8.stride(0), layer.R_fp8.stride(1),
+            layer.R_scale.stride(0), layer.R_scale.stride(1),
+            layer.L_fp8.stride(0), layer.L_fp8.stride(1),
+            layer.L_scale.stride(0), layer.L_scale.stride(1),
+            C_lr.stride(0), C_lr.stride(1),
+            RANK=rank, BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_SIZE_M=GM,
+            num_warps=8, num_stages=2, matrix_instr_nonkdim=32,
+        )
+    run_lowrank()  # compile
+    torch.cuda.synchronize()
+    t_lr = tt.do_bench(run_lowrank, warmup=25, rep=100) * 1000.0
+    amdgcn = find_amdgcn_by_name("loraq_lowrank_branch_kernel")
+    meta_lr = parse_amdgcn_metadata(amdgcn[0]) if amdgcn else {}
+    print_kernel_stats("Low-rank branch (loraq_lowrank_branch_kernel)", t_lr, f"BM={BM},BN={BN},BK={BK}", meta_lr)
+
+    # ---- 2. Residual branch (A_fp8 × W_fp4^T → fp16) ----
+    print("  2. RESIDUAL BRANCH (A_fp8 × W_fp4^T → fp16)")
+    def run_residual():
+        loraq_residual_branch_kernel[grid_mn](
+            a_fp8, a_scale, w_fp4_t, layer.weight_scale, C_res,
+            M, N, K,
+            a_fp8.stride(0), a_fp8.stride(1),
+            a_scale.stride(0), a_scale.stride(1),
+            w_fp4_t.stride(0), w_fp4_t.stride(1),
+            layer.weight_scale.stride(0), layer.weight_scale.stride(1),
+            C_res.stride(0), C_res.stride(1),
+            BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_SIZE_M=GM,
+            num_warps=8, num_stages=2, matrix_instr_nonkdim=32,
+        )
+    run_residual()
+    torch.cuda.synchronize()
+    t_res = tt.do_bench(run_residual, warmup=25, rep=100) * 1000.0
+    amdgcn = find_amdgcn_by_name("loraq_residual_branch_kernel")
+    meta_res = parse_amdgcn_metadata(amdgcn[0]) if amdgcn else {}
+    print_kernel_stats("Residual branch (loraq_residual_branch_kernel)", t_res, f"BM={BM},BN={BN},BK={BK}", meta_res)
+
+    # ---- 3. Sum + MXFP8 quant ----
+    print("  3. SUM + MXFP8 QUANT (fp16 add + output quantization)")
+    SQ_BM, SQ_BN = 128, 128
+    grid_sq = (triton.cdiv(M, SQ_BM), triton.cdiv(N, SQ_BN))
+    def run_sum_quant():
+        loraq_sum_quant_kernel[grid_sq](
+            C_lr, C_res, C_fp8, C_scale,
+            M, N,
+            C_lr.stride(0), C_lr.stride(1),
+            C_res.stride(0), C_res.stride(1),
+            C_fp8.stride(0), C_fp8.stride(1),
+            C_scale.stride(0), C_scale.stride(1),
+            BLOCK_M=SQ_BM, BLOCK_N=SQ_BN,
+        )
+    run_sum_quant()
+    torch.cuda.synchronize()
+    t_sq = tt.do_bench(run_sum_quant, warmup=25, rep=100) * 1000.0
+    amdgcn = find_amdgcn_by_name("loraq_sum_quant_kernel")
+    meta_sq = parse_amdgcn_metadata(amdgcn[0]) if amdgcn else {}
+    print_kernel_stats("Sum + quant (loraq_sum_quant_kernel)", t_sq, f"BM={SQ_BM},BN={SQ_BN}", meta_sq)
+
+    # ---- 4. Fused baselines ----
+    print("  4. FUSED BASELINES")
+    r7 = profile_loraq1(M, K, N)
+    print_kernel_stats("K7 fused (LoRaQ.1)", r7["time_us"], r7["config"], r7["metadata"])
+    r8 = profile_loraq2(M, K, N)
+    print_kernel_stats("K8 fused (LoRaQ.2)", r8["time_us"], r8["config"], r8["metadata"])
+
+    # ---- Summary ----
+    t_sum_total = t_lr + t_res + t_sq
+    print(f"  {'─' * 70}")
+    print(f"  3-Kernel Split Summary:")
+    print(f"    K_lowrank:    {t_lr:>7.1f} µs  VGPRs={meta_lr.get('total_num_vgprs','?'):<4}  occ={meta_lr.get('occupancy','?')}")
+    print(f"    K_residual:   {t_res:>7.1f} µs  VGPRs={meta_res.get('total_num_vgprs','?'):<4}  occ={meta_res.get('occupancy','?')}")
+    print(f"    K_sum_quant:  {t_sq:>7.1f} µs  VGPRs={meta_sq.get('total_num_vgprs','?'):<4}  occ={meta_sq.get('occupancy','?')}")
+    print(f"    ────────────────────────────")
+    print(f"    Sum 3 kernels: {t_sum_total:>6.1f} µs")
+    print(f"    K7 fused:      {r7['time_us']:>6.1f} µs  VGPRs={r7['metadata'].get('total_num_vgprs','?'):<4}  occ={r7['metadata'].get('occupancy','?')}")
+    print(f"    K8 fused:      {r8['time_us']:>6.1f} µs  VGPRs={r8['metadata'].get('total_num_vgprs','?'):<4}  occ={r8['metadata'].get('occupancy','?')}")
+    overhead = t_sum_total - r8['time_us']
+    print(f"")
+    print(f"  Split overhead: {overhead:+.1f} µs ({overhead/r8['time_us']*100:+.1f}%)")
+    print(f"  Split reads A_fp8 twice and adds kernel launch + sum+quant overhead.\n")
 
 
 if __name__ == "__main__":
