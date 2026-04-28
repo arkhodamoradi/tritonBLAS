@@ -14,6 +14,7 @@ Eleven kernels:
  10. loraq_split_proj_kernel             -- LoRaQ.4 K_proj: A_fp8 @ R_fp8^T → P_fp16
  11. loraq_split_main_kernel             -- LoRaQ.4 K_main: P×L^T + A×W^T → C_fp8
  12. loraq_fused_q8_perkiter_kernel      -- LoRaQ.5: per-K-iter correction (no acc_p)
+ 13. loraq_fused_q8_fp16lr_kernel        -- LoRaQ.6: like K7 but L,R are fp16
 """
 
 import triton
@@ -956,6 +957,407 @@ def loraq_fused_q8_kernel(
     )
 
     # ---- store e8m0 scales (BLOCK_M, N_GROUPS) ----
+    offs_ng = pid_n * N_GROUPS + tl.arange(0, N_GROUPS)
+    s_mask = (offs_m[:, None] < M) & (offs_ng[None, :] < (N // SCALE_GROUP))
+    tl.store(
+        C_scale_ptr + offs_m[:, None] * stride_csm + offs_ng[None, :] * stride_csn,
+        scale_e8m0, mask=s_mask,
+    )
+
+
+# ===========================================================================
+# Kernel 9 -- LoRaQ.7: like K7 but Phase 3 uses v_cvt_scalef32_pk_fp8_f16
+#   Hardware FP8 quantization via inline assembly (MI350 gfx950)
+# ===========================================================================
+
+@triton.jit
+def loraq_fused_q8_hwquant_kernel(
+    # ---- IDENTICAL interface to K7 ----
+    A_fp8_ptr, A_scale_ptr,
+    R_fp8_ptr, R_scale_ptr,
+    L_fp8_ptr, L_scale_ptr,
+    W_fp4_ptr, W_scale_ptr,
+    bias_ptr, channel_scale_ptr,
+    C_fp8_ptr, C_scale_ptr,
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    stride_am: tl.constexpr, stride_ak: tl.constexpr,
+    stride_asm: tl.constexpr, stride_ask: tl.constexpr,
+    stride_rr: tl.constexpr, stride_rk: tl.constexpr,
+    stride_rsr: tl.constexpr, stride_rsk: tl.constexpr,
+    stride_ln: tl.constexpr, stride_lr: tl.constexpr,
+    stride_lsn: tl.constexpr, stride_lsk: tl.constexpr,
+    stride_wk: tl.constexpr, stride_wn: tl.constexpr,
+    stride_wsn: tl.constexpr, stride_wsk: tl.constexpr,
+    stride_cm: tl.constexpr, stride_cn: tl.constexpr,
+    stride_csm: tl.constexpr, stride_csn: tl.constexpr,
+    stride_cs: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    RANK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """
+    LoRaQ.7 — identical to K7 but Phase 3 uses MI350 hardware instruction
+    ``v_cvt_scalef32_pk_fp8_f16`` for MXFP8 output quantization.
+
+    The hardware instruction takes packed fp16 pairs + e8m0 scale exponent
+    and produces packed fp8 output in a single ALU op, eliminating the
+    manual normalize→clamp→convert pipeline.
+
+    Grid: (ceil(M/BLOCK_M) * ceil(N/BLOCK_N),)
+    """
+    SCALE_GROUP: tl.constexpr = 32
+
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_r = tl.arange(0, RANK)
+    rm = offs_m % M
+    rn = offs_n % N
+
+    # ===== Phase 1 — Fused K-loop (identical to K7) =========================
+    acc_p = tl.zeros((BLOCK_M, RANK), dtype=tl.float32)
+    result = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    loop_k = tl.cdiv(K, BLOCK_K)
+
+    for k in range(0, loop_k):
+        k0 = k * BLOCK_K
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        offs_kg = (k0 // SCALE_GROUP) + tl.arange(0, BLOCK_K // SCALE_GROUP)
+
+        a_tile = tl.load(A_fp8_ptr + rm[:, None] * stride_am + offs_k[None, :] * stride_ak,
+                         mask=offs_k[None, :] < K, other=0.0)
+        a_scale = tl.load(A_scale_ptr + rm[:, None] * stride_asm + offs_kg[None, :] * stride_ask,
+                          mask=offs_kg[None, :] < (K // SCALE_GROUP), other=0)
+
+        r_tile = tl.load(R_fp8_ptr + offs_r[None, :] * stride_rr + offs_k[:, None] * stride_rk,
+                         mask=offs_k[:, None] < K, other=0.0)
+        r_scale = tl.load(R_scale_ptr + offs_r[:, None] * stride_rsr + offs_kg[None, :] * stride_rsk,
+                          mask=offs_kg[None, :] < (K // SCALE_GROUP), other=0)
+
+        acc_p = tl.dot_scaled(a_tile, a_scale, "e4m3", r_tile, r_scale, "e4m3",
+                               acc=acc_p, out_dtype=tl.float32)
+
+        offs_k_packed = (k0 // 2) + tl.arange(0, BLOCK_K // 2)
+        w_tile = tl.load(W_fp4_ptr + offs_k_packed[:, None] * stride_wk + rn[None, :] * stride_wn,
+                         mask=offs_k_packed[:, None] < (K // 2), other=0)
+        w_scale = tl.load(W_scale_ptr + rn[:, None] * stride_wsn + offs_kg[None, :] * stride_wsk,
+                          mask=offs_kg[None, :] < (K // SCALE_GROUP), other=0)
+
+        result = tl.dot_scaled(a_tile, a_scale, "e4m3", w_tile, w_scale, "e2m1",
+                                acc=result, out_dtype=tl.float32)
+
+    # ===== Phase 2 — P × L^T (identical to K7) ==============================
+    l_mask = (offs_n[:, None] < N) & (offs_r[None, :] < RANK)
+    l_fp8 = tl.load(L_fp8_ptr + offs_n[:, None] * stride_ln + offs_r[None, :] * stride_lr,
+                    mask=l_mask, other=0.0)
+    l_scale_group = offs_r // SCALE_GROUP
+    l_scale = tl.load(L_scale_ptr + offs_n[:, None] * stride_lsn + l_scale_group[None, :] * stride_lsk,
+                      mask=offs_n[:, None] < N, other=127)
+    l_fp16 = (l_fp8 * tl.exp2((l_scale - 127.0))).to(tl.float16)
+    result = tl.dot(acc_p.to(tl.float16), tl.trans(l_fp16), acc=result, out_dtype=tl.float32)
+
+    # ===== Phase 3 — HW MXFP8 quant via v_cvt_scalef32_pk_fp8_f16 ==========
+
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+        result = result + bias[None, :]
+
+    cs = tl.load(channel_scale_ptr + offs_n * stride_cs, mask=offs_n < N, other=1.0)
+    result_fp16 = (result.to(tl.float16) * cs[None, :]).to(tl.float16)
+
+    N_GROUPS: tl.constexpr = BLOCK_N // SCALE_GROUP
+    PAIRS_PER_GROUP: tl.constexpr = SCALE_GROUP // 2  # 16 pairs per group of 32
+
+    # ---- Compute per-group e8m0 scale (same amax logic as K7) ----
+    result_3d = tl.reshape(result_fp16, [BLOCK_M, N_GROUPS, SCALE_GROUP])
+    amax = tl.max(tl.abs(result_3d), axis=2).to(tl.float16)
+
+    # Extract fp16 exponent for e8m0 scale (offset=8 for e4m3 max≈448≈2^8.8)
+    amax_bits = amax.to(tl.uint16, bitcast=True)
+    bf16_exp = (amax_bits >> 10) & 0x1F  # fp16 has 5-bit exponent
+    # Convert fp16 biased exp (bias=15) to e8m0 biased exp (bias=127):
+    # e8m0 = fp16_exp - 15 + 127 - 8 = fp16_exp + 104
+    # But we need the full 8-bit range. Use fp32 path instead:
+    amax_f32 = amax.to(tl.float32)
+    amax_u32 = amax_f32.to(tl.uint32, bitcast=True)
+    # Round amax up to nearest power of 2
+    amax_u32 = (amax_u32 + 0x200000).to(tl.uint32) & 0xFF800000
+    # Extract fp32 biased exponent (8-bit, bias=127)
+    fp32_exp = (amax_u32 >> 23) & 0xFF
+    # e8m0 scale = fp32_exp - 8 (offset for e4m3 max range)
+    scale_e8m0 = tl.maximum(fp32_exp.to(tl.int32) - 8, 0)
+    scale_e8m0 = tl.minimum(scale_e8m0, 255).to(tl.uint8)  # (BLOCK_M, N_GROUPS)
+
+    # ---- Store e8m0 scales ----
+    offs_ng = pid_n * N_GROUPS + tl.arange(0, N_GROUPS)
+    s_mask = (offs_m[:, None] < M) & (offs_ng[None, :] < (N // SCALE_GROUP))
+    tl.store(C_scale_ptr + offs_m[:, None] * stride_csm + offs_ng[None, :] * stride_csn,
+             scale_e8m0, mask=s_mask)
+
+    # ---- Pack fp16 pairs and call HW conversion ----
+    # Reshape result to pairs: (BLOCK_M, BLOCK_N//2, 2)
+    result_pairs = tl.reshape(result_fp16, (BLOCK_M, BLOCK_N // 2, 2))
+    x_lo, x_hi = tl.split(result_pairs)
+    x_lo = tl.reshape(x_lo, (BLOCK_M, BLOCK_N // 2))
+    x_hi = tl.reshape(x_hi, (BLOCK_M, BLOCK_N // 2))
+
+    x_lo_u16 = x_lo.to(tl.uint16, bitcast=True)
+    x_hi_u16 = x_hi.to(tl.uint16, bitcast=True)
+    x_pk = (x_lo_u16.to(tl.uint32) | (x_hi_u16.to(tl.uint32) << 16)).to(tl.float32, bitcast=True)
+
+    # Broadcast scale to pairs: each group of 16 pairs shares one scale
+    scale_broad = tl.broadcast_to(
+        tl.reshape(scale_e8m0.to(tl.uint32), (BLOCK_M, N_GROUPS, 1)),
+        (BLOCK_M, N_GROUPS, PAIRS_PER_GROUP),
+    )
+    scale_flat = tl.reshape(scale_broad, (BLOCK_M, BLOCK_N // 2))
+    scale_f32 = scale_flat << 23
+
+    # HW FP8 conversion (RTNE)
+    fp8_packed = tl.inline_asm_elementwise(
+        "v_cvt_scalef32_pk_fp8_f16 $0, $1, $2",
+        "=v,v,v",
+        args=[x_pk, scale_f32],
+        dtype=tl.uint16,
+        is_pure=True,
+        pack=1,
+    )
+
+    # ---- Store fp8 output (split uint16 into 2 uint8 bytes) ----
+    fp8_lo = fp8_packed.to(tl.uint8)
+    fp8_hi = (fp8_packed >> 8).to(tl.uint8)
+
+    even_offs = tl.arange(0, BLOCK_N // 2) * 2
+    odd_offs = even_offs + 1
+    base_n = pid_n * BLOCK_N
+
+    c_mask_even = (offs_m[:, None] < M) & ((base_n + even_offs)[None, :] < N)
+    c_mask_odd = (offs_m[:, None] < M) & ((base_n + odd_offs)[None, :] < N)
+
+    tl.store(C_fp8_ptr + offs_m[:, None] * stride_cm + (base_n + even_offs)[None, :] * stride_cn,
+             fp8_lo, mask=c_mask_even)
+    tl.store(C_fp8_ptr + offs_m[:, None] * stride_cm + (base_n + odd_offs)[None, :] * stride_cn,
+             fp8_hi, mask=c_mask_odd)
+
+
+# ===========================================================================
+# Kernel 13 -- LoRaQ.6: like K7 but L and R are fp16 (no fp8 quantization)
+#   C_fp8 = q8( fp16(dequant(A_fp8)) @ R_fp16^T @ L_fp16^T
+#             + q8(A) @ q4(W)^T )
+# ===========================================================================
+
+@triton.jit
+def loraq_fused_q8_fp16lr_kernel(
+    # ---- FP8 activation (pre-quantized) ----
+    A_fp8_ptr,          # (M, K)     float8_e4m3fn
+    A_scale_ptr,        # (M, K//32) uint8 e8m0
+    # ---- FP16 low-rank factor R ----
+    R_ptr,              # (RANK, K)  fp16  (row-major)
+    # ---- FP16 low-rank factor L ----
+    L_ptr,              # (N, RANK)  fp16
+    # ---- FP4 weight (already transposed: K//2 × N) ----
+    W_fp4_ptr,          # (K//2, N) uint8 packed e2m1
+    W_scale_ptr,        # (N, K//32) uint8 e8m0
+    # ---- optional bias ----
+    bias_ptr,           # (N,) float32  (ignored when HAS_BIAS=False)
+    # ---- channel-wise quantization scale ----
+    channel_scale_ptr,  # (N,) fp16 — per-column scale before output quant
+    # ---- outputs ----
+    C_fp8_ptr,          # (M, N)     uint8
+    C_scale_ptr,        # (M, N//32) uint8 e8m0
+    # ---- dimensions ----
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    # ---- strides: A_fp8 (M, K) ----
+    stride_am: tl.constexpr, stride_ak: tl.constexpr,
+    # ---- strides: A_scale (M, K//32) ----
+    stride_asm: tl.constexpr, stride_ask: tl.constexpr,
+    # ---- strides: R (RANK, K) ----
+    stride_rr: tl.constexpr, stride_rk: tl.constexpr,
+    # ---- strides: L (N, RANK) ----
+    stride_ln: tl.constexpr, stride_lr: tl.constexpr,
+    # ---- strides: W_fp4 (K//2, N) ----
+    stride_wk: tl.constexpr, stride_wn: tl.constexpr,
+    # ---- strides: W_scale (N, K//32) ----
+    stride_wsn: tl.constexpr, stride_wsk: tl.constexpr,
+    # ---- strides: C_fp8 (M, N) ----
+    stride_cm: tl.constexpr, stride_cn: tl.constexpr,
+    # ---- strides: C_scale (M, N//32) ----
+    stride_csm: tl.constexpr, stride_csn: tl.constexpr,
+    # ---- stride: channel_scale (N,) ----
+    stride_cs: tl.constexpr,
+    # ---- compile-time constants ----
+    HAS_BIAS: tl.constexpr,
+    RANK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """
+    LoRaQ.6 — like K7 but L and R are stored as fp16 (not fp8+scale).
+
+    Computes:
+        C_fp8 = MXFP8_quant(
+            channel_scale * (
+                dequant_fp16(A_fp8) @ R_fp16^T @ L_fp16^T
+                + A_fp8 @ W_fp4^T
+                [+ bias]
+            )
+        )
+
+    Phase 1  K-loop:
+             - A×R^T: dequant A_fp8→fp16 in-register, then tl.dot(A_fp16, R_fp16^T)
+             - A×W^T: dot_scaled(A_fp8, W_fp4) — same as K7
+             Both reuse the same A_fp8 tile + A_scale per iteration.
+
+    Phase 2  P × L^T: tl.dot(P_fp16, L_fp16^T) — L loaded directly as fp16.
+
+    Phase 3  Same MXFP8 output quant as K7.
+
+    Grid: (ceil(M/BLOCK_M) * ceil(N/BLOCK_N),)
+    """
+    SCALE_GROUP: tl.constexpr = 32
+    K_GROUPS: tl.constexpr = BLOCK_K // SCALE_GROUP
+
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_r = tl.arange(0, RANK)
+
+    rm = offs_m % M
+    rn = offs_n % N
+
+    # ===== Phase 1 — Fused K-loop  (A×R^T fp16 and A×W^T dot_scaled) =======
+
+    acc_p = tl.zeros((BLOCK_M, RANK), dtype=tl.float32)
+    result = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    loop_k = tl.cdiv(K, BLOCK_K)
+
+    for k in range(0, loop_k):
+        k0 = k * BLOCK_K
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        offs_kg = (k0 // SCALE_GROUP) + tl.arange(0, K_GROUPS)
+
+        # ---- Load A fp8 tile (BLOCK_M, BLOCK_K) ----
+        a_fp8 = tl.load(
+            A_fp8_ptr + rm[:, None] * stride_am + offs_k[None, :] * stride_ak,
+            mask=offs_k[None, :] < K, other=0.0,
+        )
+        # ---- Load A scale (BLOCK_M, K_GROUPS) ----
+        a_scale = tl.load(
+            A_scale_ptr + rm[:, None] * stride_asm + offs_kg[None, :] * stride_ask,
+            mask=offs_kg[None, :] < (K // SCALE_GROUP), other=0,
+        )
+
+        # ---- Dequant A_fp8 → fp16 for the low-rank branch ----
+        # Reshape to (BLOCK_M, K_GROUPS, 32), multiply by per-group scale
+        a_fp8_3d = tl.reshape(a_fp8.to(tl.float32), [BLOCK_M, K_GROUPS, SCALE_GROUP])
+        a_scale_3d = tl.reshape(
+            tl.exp2((a_scale.to(tl.float32) - 127.0)),
+            [BLOCK_M, K_GROUPS, 1],
+        )
+        a_fp16 = tl.reshape(a_fp8_3d * a_scale_3d, [BLOCK_M, BLOCK_K]).to(tl.float16)
+
+        # ---- A × R^T via tl.dot fp16 ----
+        # R is (RANK, K) fp16 → load as (BLOCK_K, RANK) transposed
+        r_tile = tl.load(
+            R_ptr + offs_r[None, :] * stride_rr + offs_k[:, None] * stride_rk,
+            mask=offs_k[:, None] < K, other=0.0,
+        ).to(tl.float16)   # (BLOCK_K, RANK)
+
+        acc_p = tl.dot(a_fp16, r_tile, acc=acc_p, out_dtype=tl.float32)
+
+        # ---- A × W^T via dot_scaled (same as K7) ----
+        offs_k_packed = (k0 // 2) + tl.arange(0, BLOCK_K // 2)
+        w_tile = tl.load(
+            W_fp4_ptr + offs_k_packed[:, None] * stride_wk + rn[None, :] * stride_wn,
+            mask=offs_k_packed[:, None] < (K // 2), other=0,
+        )
+        w_scale = tl.load(
+            W_scale_ptr + rn[:, None] * stride_wsn + offs_kg[None, :] * stride_wsk,
+            mask=offs_kg[None, :] < (K // SCALE_GROUP), other=0,
+        )
+        result = tl.dot_scaled(a_fp8, a_scale, "e4m3",
+                                w_tile, w_scale, "e2m1",
+                                acc=result, out_dtype=tl.float32)
+
+    # ===== Phase 2 — P × L^T  (fp16 × fp16, no dequant needed) =============
+
+    # Load L tile (BLOCK_N, RANK) fp16
+    l_mask = (offs_n[:, None] < N) & (offs_r[None, :] < RANK)
+    l_tile = tl.load(
+        L_ptr + offs_n[:, None] * stride_ln + offs_r[None, :] * stride_lr,
+        mask=l_mask, other=0.0,
+    ).to(tl.float16)
+
+    # Single dot: (BLOCK_M, RANK) @ (RANK, BLOCK_N) → (BLOCK_M, BLOCK_N)
+    result = tl.dot(acc_p.to(tl.float16), tl.trans(l_tile),
+                    acc=result, out_dtype=tl.float32)
+
+    # ===== Phase 3 — bias + channel-wise scaling + MXFP8 quant =============
+
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+        result = result + bias[None, :]
+
+    cs = tl.load(
+        channel_scale_ptr + offs_n * stride_cs,
+        mask=offs_n < N, other=1.0,
+    )
+    result = result.to(tl.float16) * cs[None, :]
+
+    N_GROUPS: tl.constexpr = BLOCK_N // SCALE_GROUP
+
+    result_3d = tl.reshape(result, [BLOCK_M, N_GROUPS, SCALE_GROUP])
+    amax = tl.max(tl.abs(result_3d), axis=2)
+
+    amax_i = amax.to(tl.int32, bitcast=True)
+    amax_i = (amax_i + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
+    amax = amax_i.to(tl.float32, bitcast=True)
+
+    scale_exp = tl.log2(amax).floor() - 7
+    scale_exp = tl.clamp(scale_exp, min=-127, max=127)
+    scale_e8m0 = scale_exp.to(tl.uint8) + 127
+
+    quant_scale = tl.exp2(-scale_exp)
+    quant_scale_3d = tl.reshape(quant_scale, [BLOCK_M, N_GROUPS, 1])
+
+    qx_3d = result_3d * quant_scale_3d
+    qx = tl.reshape(qx_3d, [BLOCK_M, BLOCK_N])
+    qx = tl.clamp(qx, min=-448.0, max=448.0)
+
+    fp8_out = qx.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(
+        C_fp8_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+        fp8_out, mask=c_mask,
+    )
+
     offs_ng = pid_n * N_GROUPS + tl.arange(0, N_GROUPS)
     s_mask = (offs_m[:, None] < M) & (offs_ng[None, :] < (N // SCALE_GROUP))
     tl.store(

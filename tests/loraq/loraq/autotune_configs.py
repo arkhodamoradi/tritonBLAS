@@ -455,6 +455,95 @@ class AutotunedLoRaQ3:
 
 
 # ---------------------------------------------------------------------------
+# Runtime autotuner for LoRaQ.6 (K13: fp16 L and R)
+# ---------------------------------------------------------------------------
+
+class AutotunedLoRaQFP16LR:
+    """
+    Runtime autotuner for ``loraq_fused_q8_fp16lr_kernel`` (K13).
+
+    Like AutotunedLoRaQ but R and L are fp16 (no scales).
+    """
+
+    def __init__(self, kernel_fn, configs=None, rank=64, warmup=10, rep=50):
+        self.kernel_fn = kernel_fn
+        self.configs = configs or LORAQ_Q8_CONFIGS
+        self.rank = rank
+        self.warmup = warmup
+        self.rep = rep
+        self._cache = {}
+
+    def _launch(self, cfg, a_fp8, a_scale, R, L, w_fp4_t, w_scale,
+                bias_ptr, channel_scale, c_fp8, c_scale, M, N, K, has_bias):
+        bm = cfg.kwargs["BLOCK_M"]
+        bn = cfg.kwargs["BLOCK_N"]
+        bk = cfg.kwargs["BLOCK_K"]
+        gm = cfg.kwargs["GROUP_SIZE_M"]
+        grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+        self.kernel_fn[grid](
+            a_fp8, a_scale, R, L,
+            w_fp4_t, w_scale, bias_ptr, channel_scale,
+            c_fp8, c_scale, M, N, K,
+            a_fp8.stride(0), a_fp8.stride(1),
+            a_scale.stride(0), a_scale.stride(1),
+            R.stride(0), R.stride(1),
+            L.stride(0), L.stride(1),
+            w_fp4_t.stride(0), w_fp4_t.stride(1),
+            w_scale.stride(0), w_scale.stride(1),
+            c_fp8.stride(0), c_fp8.stride(1),
+            c_scale.stride(0), c_scale.stride(1),
+            channel_scale.stride(0),
+            HAS_BIAS=has_bias, RANK=self.rank,
+            BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_SIZE_M=gm,
+            num_warps=cfg.num_warps, num_stages=cfg.num_stages,
+            matrix_instr_nonkdim=32,
+        )
+
+    def __call__(self, a_fp8, a_scale, R, L, w_fp4_t, w_scale,
+                 M, N, K, bias=None, channel_scale=None):
+        key = (M, N, K)
+        has_bias = bias is not None
+        bias_ptr = bias if has_bias else a_fp8
+        if channel_scale is None:
+            channel_scale = torch.ones(N, dtype=torch.float16, device=a_fp8.device)
+
+        if key not in self._cache:
+            c_fp8 = torch.empty((M, N), dtype=torch.uint8, device=a_fp8.device)
+            c_scale = torch.empty((M, N // 32), dtype=torch.uint8, device=a_fp8.device)
+            best_ms, best_cfg = float("inf"), None
+            for cfg in self.configs:
+                if cfg.kwargs["BLOCK_K"] > K:
+                    continue
+                try:
+                    def fn(cfg=cfg):
+                        self._launch(cfg, a_fp8, a_scale, R, L, w_fp4_t, w_scale,
+                                     bias_ptr, channel_scale, c_fp8, c_scale,
+                                     M, N, K, has_bias)
+                    ms = tt.do_bench(fn, warmup=self.warmup, rep=self.rep)
+                    if ms < best_ms:
+                        best_ms, best_cfg = ms, cfg
+                except Exception:
+                    continue
+            if best_cfg is None:
+                best_cfg = triton.Config(
+                    {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+                    num_warps=8, num_stages=2)
+            self._cache[key] = {"config": best_cfg, "time_ms": best_ms}
+
+        cfg = self._cache[key]["config"]
+        c_fp8 = torch.empty((M, N), dtype=torch.uint8, device=a_fp8.device)
+        c_scale = torch.empty((M, N // 32), dtype=torch.uint8, device=a_fp8.device)
+        self._launch(cfg, a_fp8, a_scale, R, L, w_fp4_t, w_scale,
+                     bias_ptr, channel_scale, c_fp8, c_scale,
+                     M, N, K, has_bias)
+        c_fp8 = c_fp8.view(torch.float8_e4m3fn)
+        return c_fp8, c_scale
+
+    def get_best_config(self, M, N, K):
+        return self._cache.get((M, N, K))
+
+
+# ---------------------------------------------------------------------------
 # Runtime autotuner for LoRaQ.4 split kernels (K10 proj + K11 main)
 # ---------------------------------------------------------------------------
 
