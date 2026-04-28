@@ -517,6 +517,7 @@ def run_k8_breakdown(M, K, N):
     """Profile K8 split into 3 kernels: low-rank, residual, sum+quant."""
     from loraq.kernels import (
         loraq_lowrank_branch_kernel,
+        loraq_lowrank_branch_v1_kernel,
         loraq_residual_branch_kernel,
         loraq_sum_quant_kernel,
     )
@@ -533,7 +534,28 @@ def run_k8_breakdown(M, K, N):
     layer = TritonLinearLoRaQ.from_float(ref)
     w_fp4_t = layer.weight_fp4.t().contiguous()
     rank = 64
-    BM, BN, BK, GM = 128, 128, 64, 8
+
+    # Autotune configs: (BM, BN, BK, GM, warps, stages, waves_per_eu)
+    BREAKDOWN_CONFIGS = []
+    for bm, bn, bk in [(128, 128, 64), (128, 128, 128), (128, 256, 64), (128, 256, 128), (256, 128, 128)]:
+        for gm in [4, 8]:
+            for nw in [4, 8]:
+                for wpe in [0, 1, 2, 3, 4]:
+                    BREAKDOWN_CONFIGS.append((bm, bn, bk, gm, nw, 2, wpe))
+
+    def _sweep_kernel(name, launch_fn, configs):
+        """Mini-sweep: try all configs, return (best_time_us, best_cfg_str)."""
+        best_ms, best_cfg = float("inf"), configs[0]
+        for cfg in configs:
+            try:
+                launch_fn(*cfg)
+                torch.cuda.synchronize()
+                ms = tt.do_bench(lambda c=cfg: launch_fn(*c), warmup=10, rep=50)
+                if ms < best_ms:
+                    best_ms, best_cfg = ms, cfg
+            except Exception:
+                continue
+        return best_ms * 1000.0, f"BM={best_cfg[0]},BN={best_cfg[1]},BK={best_cfg[2]},GM={best_cfg[3]},w={best_cfg[4]},wpe={best_cfg[6]}"
 
     # Outputs
     C_lr = torch.empty((M, N), dtype=torch.float16, device="cuda")
@@ -541,65 +563,70 @@ def run_k8_breakdown(M, K, N):
     C_fp8 = torch.empty((M, N), dtype=torch.uint8, device="cuda")
     C_scale = torch.empty((M, N // 32), dtype=torch.uint8, device="cuda")
 
-    grid_mn = (triton.cdiv(M, BM) * triton.cdiv(N, BN),)
-
-    # ---- 1. Low-rank branch (fused: A×R^T → P quant → P×L^T → fp16) ----
-    print("  1. LOW-RANK BRANCH (fused kernel: A×R^T → quant(P) → P×L^T)")
-    def run_lowrank():
-        loraq_lowrank_branch_kernel[grid_mn](
+    # ---- 1. Low-rank branch K8-style (autotuned) ----
+    print("  1. LOW-RANK BRANCH K8-style (autotuned: A×R^T → quant(P) → P×L^T)")
+    def _lr_launch(bm, bn, bk, gm, nw, ns, wpe):
+        grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+        loraq_lowrank_branch_kernel[grid](
             a_fp8, a_scale, layer.R_fp8, layer.R_scale,
-            layer.L_fp8, layer.L_scale, C_lr,
-            M, N, K,
-            a_fp8.stride(0), a_fp8.stride(1),
-            a_scale.stride(0), a_scale.stride(1),
-            layer.R_fp8.stride(0), layer.R_fp8.stride(1),
-            layer.R_scale.stride(0), layer.R_scale.stride(1),
-            layer.L_fp8.stride(0), layer.L_fp8.stride(1),
-            layer.L_scale.stride(0), layer.L_scale.stride(1),
+            layer.L_fp8, layer.L_scale, C_lr, M, N, K,
+            a_fp8.stride(0), a_fp8.stride(1), a_scale.stride(0), a_scale.stride(1),
+            layer.R_fp8.stride(0), layer.R_fp8.stride(1), layer.R_scale.stride(0), layer.R_scale.stride(1),
+            layer.L_fp8.stride(0), layer.L_fp8.stride(1), layer.L_scale.stride(0), layer.L_scale.stride(1),
             C_lr.stride(0), C_lr.stride(1),
-            RANK=rank, BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_SIZE_M=GM,
-            num_warps=8, num_stages=2, matrix_instr_nonkdim=32,
+            RANK=rank, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_SIZE_M=gm,
+            num_warps=nw, num_stages=ns, matrix_instr_nonkdim=32, waves_per_eu=wpe,
         )
-    run_lowrank()  # compile
-    torch.cuda.synchronize()
-    t_lr = tt.do_bench(run_lowrank, warmup=25, rep=100) * 1000.0
+    t_lr, cfg_lr = _sweep_kernel("lowrank_k8", _lr_launch, BREAKDOWN_CONFIGS)
     amdgcn = find_amdgcn_by_name("loraq_lowrank_branch_kernel")
     meta_lr = parse_amdgcn_metadata(amdgcn[0]) if amdgcn else {}
-    print_kernel_stats("Low-rank branch (loraq_lowrank_branch_kernel)", t_lr, f"BM={BM},BN={BN},BK={BK}", meta_lr)
+    print_kernel_stats("Low-rank K8-style (autotuned)", t_lr, cfg_lr, meta_lr)
 
-    # ---- 2. Residual branch (A_fp8 × W_fp4^T → fp16) ----
-    print("  2. RESIDUAL BRANCH (A_fp8 × W_fp4^T → fp16)")
-    def run_residual():
-        loraq_residual_branch_kernel[grid_mn](
-            a_fp8, a_scale, w_fp4_t, layer.weight_scale, C_res,
-            M, N, K,
-            a_fp8.stride(0), a_fp8.stride(1),
-            a_scale.stride(0), a_scale.stride(1),
-            w_fp4_t.stride(0), w_fp4_t.stride(1),
-            layer.weight_scale.stride(0), layer.weight_scale.stride(1),
-            C_res.stride(0), C_res.stride(1),
-            BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_SIZE_M=GM,
-            num_warps=8, num_stages=2, matrix_instr_nonkdim=32,
+    # ---- 1b. Low-rank branch K7-style (autotuned) ----
+    print("  1b. LOW-RANK BRANCH K7-style (autotuned: fp16 P×L^T)")
+    def _lr_v1_launch(bm, bn, bk, gm, nw, ns, wpe):
+        grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+        loraq_lowrank_branch_v1_kernel[grid](
+            a_fp8, a_scale, layer.R_fp8, layer.R_scale,
+            layer.L_fp8, layer.L_scale, C_lr, M, N, K,
+            a_fp8.stride(0), a_fp8.stride(1), a_scale.stride(0), a_scale.stride(1),
+            layer.R_fp8.stride(0), layer.R_fp8.stride(1), layer.R_scale.stride(0), layer.R_scale.stride(1),
+            layer.L_fp8.stride(0), layer.L_fp8.stride(1), layer.L_scale.stride(0), layer.L_scale.stride(1),
+            C_lr.stride(0), C_lr.stride(1),
+            RANK=rank, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_SIZE_M=gm,
+            num_warps=nw, num_stages=ns, matrix_instr_nonkdim=32, waves_per_eu=wpe,
         )
-    run_residual()
-    torch.cuda.synchronize()
-    t_res = tt.do_bench(run_residual, warmup=25, rep=100) * 1000.0
+    t_lr_v1, cfg_lr_v1 = _sweep_kernel("lowrank_k7", _lr_v1_launch, BREAKDOWN_CONFIGS)
+    amdgcn_v1 = find_amdgcn_by_name("loraq_lowrank_branch_v1_kernel")
+    meta_lr_v1 = parse_amdgcn_metadata(amdgcn_v1[0]) if amdgcn_v1 else {}
+    print_kernel_stats("Low-rank K7-style (autotuned)", t_lr_v1, cfg_lr_v1, meta_lr_v1)
+
+    # ---- 2. Residual branch (autotuned) ----
+    print("  2. RESIDUAL BRANCH (autotuned: A_fp8 × W_fp4^T → fp16)")
+    def _res_launch(bm, bn, bk, gm, nw, ns, wpe):
+        grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+        loraq_residual_branch_kernel[grid](
+            a_fp8, a_scale, w_fp4_t, layer.weight_scale, C_res, M, N, K,
+            a_fp8.stride(0), a_fp8.stride(1), a_scale.stride(0), a_scale.stride(1),
+            w_fp4_t.stride(0), w_fp4_t.stride(1), layer.weight_scale.stride(0), layer.weight_scale.stride(1),
+            C_res.stride(0), C_res.stride(1),
+            BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_SIZE_M=gm,
+            num_warps=nw, num_stages=ns, matrix_instr_nonkdim=32, waves_per_eu=wpe,
+        )
+    t_res, cfg_res = _sweep_kernel("residual", _res_launch, BREAKDOWN_CONFIGS)
     amdgcn = find_amdgcn_by_name("loraq_residual_branch_kernel")
     meta_res = parse_amdgcn_metadata(amdgcn[0]) if amdgcn else {}
-    print_kernel_stats("Residual branch (loraq_residual_branch_kernel)", t_res, f"BM={BM},BN={BN},BK={BK}", meta_res)
+    print_kernel_stats("Residual branch (autotuned)", t_res, cfg_res, meta_res)
 
-    # ---- 3. Sum + MXFP8 quant ----
-    print("  3. SUM + MXFP8 QUANT (fp16 add + output quantization)")
+    # ---- 3. Sum + MXFP8 quant (fixed config, simple kernel) ----
+    print("  3. SUM + MXFP8 QUANT")
     SQ_BM, SQ_BN = 128, 128
     grid_sq = (triton.cdiv(M, SQ_BM), triton.cdiv(N, SQ_BN))
     def run_sum_quant():
         loraq_sum_quant_kernel[grid_sq](
-            C_lr, C_res, C_fp8, C_scale,
-            M, N,
-            C_lr.stride(0), C_lr.stride(1),
-            C_res.stride(0), C_res.stride(1),
-            C_fp8.stride(0), C_fp8.stride(1),
-            C_scale.stride(0), C_scale.stride(1),
+            C_lr, C_res, C_fp8, C_scale, M, N,
+            C_lr.stride(0), C_lr.stride(1), C_res.stride(0), C_res.stride(1),
+            C_fp8.stride(0), C_fp8.stride(1), C_scale.stride(0), C_scale.stride(1),
             BLOCK_M=SQ_BM, BLOCK_N=SQ_BN,
         )
     run_sum_quant()
@@ -607,7 +634,7 @@ def run_k8_breakdown(M, K, N):
     t_sq = tt.do_bench(run_sum_quant, warmup=25, rep=100) * 1000.0
     amdgcn = find_amdgcn_by_name("loraq_sum_quant_kernel")
     meta_sq = parse_amdgcn_metadata(amdgcn[0]) if amdgcn else {}
-    print_kernel_stats("Sum + quant (loraq_sum_quant_kernel)", t_sq, f"BM={SQ_BM},BN={SQ_BN}", meta_sq)
+    print_kernel_stats("Sum + quant", t_sq, f"BM={SQ_BM},BN={SQ_BN}", meta_sq)
 
     # ---- 4. Fused baselines ----
     print("  4. FUSED BASELINES")
@@ -620,11 +647,14 @@ def run_k8_breakdown(M, K, N):
     t_sum_total = t_lr + t_res + t_sq
     print(f"  {'─' * 70}")
     print(f"  3-Kernel Split Summary:")
-    print(f"    K_lowrank:    {t_lr:>7.1f} µs  VGPRs={meta_lr.get('total_num_vgprs','?'):<4}  occ={meta_lr.get('occupancy','?')}")
+    print(f"    K_lowrank K8: {t_lr:>7.1f} µs  VGPRs={meta_lr.get('total_num_vgprs','?'):<4}  occ={meta_lr.get('occupancy','?')}  (dot_scaled P×L^T)")
+    print(f"    K_lowrank K7: {t_lr_v1:>7.1f} µs  VGPRs={meta_lr_v1.get('total_num_vgprs','?'):<4}  occ={meta_lr_v1.get('occupancy','?')}  (fp16 dot P×L^T)")
     print(f"    K_residual:   {t_res:>7.1f} µs  VGPRs={meta_res.get('total_num_vgprs','?'):<4}  occ={meta_res.get('occupancy','?')}")
     print(f"    K_sum_quant:  {t_sq:>7.1f} µs  VGPRs={meta_sq.get('total_num_vgprs','?'):<4}  occ={meta_sq.get('occupancy','?')}")
     print(f"    ────────────────────────────")
-    print(f"    Sum 3 kernels: {t_sum_total:>6.1f} µs")
+    t_sum_v1 = t_lr_v1 + t_res + t_sq
+    print(f"    Sum (K8-style): {t_sum_total:>6.1f} µs")
+    print(f"    Sum (K7-style): {t_sum_v1:>6.1f} µs")
     print(f"    K7 fused:      {r7['time_us']:>6.1f} µs  VGPRs={r7['metadata'].get('total_num_vgprs','?'):<4}  occ={r7['metadata'].get('occupancy','?')}")
     print(f"    K8 fused:      {r8['time_us']:>6.1f} µs  VGPRs={r8['metadata'].get('total_num_vgprs','?'):<4}  occ={r8['metadata'].get('occupancy','?')}")
     overhead = t_sum_total - r8['time_us']

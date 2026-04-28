@@ -1057,6 +1057,79 @@ def loraq_lowrank_branch_kernel(
     tl.store(C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, c, mask=c_mask)
 
 
+# -- K_lowrank_v1: K7-style (fp16 dot for P×L^T, no P requantization) --
+
+@triton.jit
+def loraq_lowrank_branch_v1_kernel(
+    A_fp8_ptr, A_scale_ptr,
+    R_fp8_ptr, R_scale_ptr,
+    L_fp8_ptr, L_scale_ptr,
+    C_ptr,  # (M, N) fp16 output
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    stride_am: tl.constexpr, stride_ak: tl.constexpr,
+    stride_asm: tl.constexpr, stride_ask: tl.constexpr,
+    stride_rr: tl.constexpr, stride_rk: tl.constexpr,
+    stride_rsr: tl.constexpr, stride_rsk: tl.constexpr,
+    stride_ln: tl.constexpr, stride_lr: tl.constexpr,
+    stride_lsn: tl.constexpr, stride_lsk: tl.constexpr,
+    stride_cm: tl.constexpr, stride_cn: tl.constexpr,
+    RANK: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """Low-rank branch (K7-style): A_fp8×R_fp8^T → P → fp16(P)×dequant_fp16(L)^T → fp16."""
+    SCALE_GROUP: tl.constexpr = 32
+
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_r = tl.arange(0, RANK)
+    rm = offs_m % M
+
+    # Phase 1: A × R^T via dot_scaled (same as K8 variant)
+    acc_p = tl.zeros((BLOCK_M, RANK), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        k0 = k * BLOCK_K
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        offs_kg = (k0 // SCALE_GROUP) + tl.arange(0, BLOCK_K // SCALE_GROUP)
+
+        a_tile = tl.load(A_fp8_ptr + rm[:, None] * stride_am + offs_k[None, :] * stride_ak,
+                         mask=offs_k[None, :] < K, other=0.0)
+        a_scale = tl.load(A_scale_ptr + rm[:, None] * stride_asm + offs_kg[None, :] * stride_ask,
+                          mask=offs_kg[None, :] < (K // SCALE_GROUP), other=0)
+        r_tile = tl.load(R_fp8_ptr + offs_r[None, :] * stride_rr + offs_k[:, None] * stride_rk,
+                         mask=offs_k[:, None] < K, other=0.0)
+        r_scale = tl.load(R_scale_ptr + offs_r[:, None] * stride_rsr + offs_kg[None, :] * stride_rsk,
+                          mask=offs_kg[None, :] < (K // SCALE_GROUP), other=0)
+        acc_p = tl.dot_scaled(a_tile, a_scale, "e4m3", r_tile, r_scale, "e4m3",
+                               acc=acc_p, out_dtype=tl.float32)
+
+    # Phase 2: P × L^T via fp16 tl.dot (K7-style, no P requantization)
+    l_mask = (offs_n[:, None] < N) & (offs_r[None, :] < RANK)
+    l_fp8 = tl.load(L_fp8_ptr + offs_n[:, None] * stride_ln + offs_r[None, :] * stride_lr,
+                    mask=l_mask, other=0.0)
+    l_scale_group = offs_r // SCALE_GROUP
+    l_scale = tl.load(L_scale_ptr + offs_n[:, None] * stride_lsn + l_scale_group[None, :] * stride_lsk,
+                      mask=offs_n[:, None] < N, other=127)
+    l_fp16 = (l_fp8 * tl.exp2((l_scale - 127.0))).to(tl.float16)
+
+    result = tl.dot(acc_p.to(tl.float16), tl.trans(l_fp16), out_dtype=tl.float32)
+
+    # Store fp16
+    c = result.to(tl.float16)
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, c, mask=c_mask)
+
+
 # -- K_residual: standalone fp8×fp4 GEMM (A×W^T → fp16 out) --
 
 @triton.jit
