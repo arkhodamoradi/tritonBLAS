@@ -1668,7 +1668,7 @@ def loraq_fused_q8_scaled_kernel(
     C_fp8_ptr,          # (M, N)     uint8  (will be viewed as float8_e4m3fn)
     C_scale_ptr,        # (M, N//32) uint8 e8m0
     # ---- dimensions (runtime — constexpr causes MLIR crash for this kernel) ----
-    M, N, K,
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
     # ---- strides: A_fp8 (M, K) ----
     stride_am: tl.constexpr, stride_ak: tl.constexpr,
     # ---- strides: A_scale (M, K//32) ----

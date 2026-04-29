@@ -219,11 +219,12 @@ def profile_loraq1(M, K, N, warmup=25, iters=100):
     # Get best config
     best = at.get_best_config(M, N, K)
     cfg = best["config"] if best else None
+    wpe = best.get("waves_per_eu", "?") if best else "?"
     cfg_str = "?"
     if cfg:
         cfg_str = (f"BM={cfg.kwargs['BLOCK_M']}, BN={cfg.kwargs['BLOCK_N']}, "
                    f"BK={cfg.kwargs['BLOCK_K']}, GM={cfg.kwargs['GROUP_SIZE_M']}, "
-                   f"warps={cfg.num_warps}, stages={cfg.num_stages}")
+                   f"warps={cfg.num_warps}, stages={cfg.num_stages}, wpe={wpe}")
 
     # Find .amdgcn by kernel function name (most recent = best config)
     amdgcn_files = find_amdgcn_by_name("loraq_fused_q8_kernel")
@@ -264,11 +265,12 @@ def profile_loraq2(M, K, N, warmup=25, iters=100):
 
     best = at.get_best_config(M, N, K)
     cfg = best["config"] if best else None
+    wpe = best.get("waves_per_eu", "?") if best else "?"
     cfg_str = "?"
     if cfg:
         cfg_str = (f"BM={cfg.kwargs['BLOCK_M']}, BN={cfg.kwargs['BLOCK_N']}, "
                    f"BK={cfg.kwargs['BLOCK_K']}, GM={cfg.kwargs['GROUP_SIZE_M']}, "
-                   f"warps={cfg.num_warps}, stages={cfg.num_stages}")
+                   f"warps={cfg.num_warps}, stages={cfg.num_stages}, wpe={wpe}")
 
     amdgcn_files = find_amdgcn_by_name("loraq_fused_q8_scaled_kernel")
     metadata = parse_amdgcn_metadata(amdgcn_files[0]) if amdgcn_files else {}

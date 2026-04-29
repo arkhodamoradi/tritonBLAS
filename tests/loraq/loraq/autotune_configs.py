@@ -28,45 +28,50 @@ import triton.testing as tt
 # Config definitions  (same format as triton.Config for @triton.autotune)
 # ---------------------------------------------------------------------------
 
-LORAQ_Q8_CONFIGS = [
+# Base configs without waves_per_eu
+_BASE_CONFIGS = [
     # ---- Standard configs (good for M ≥ 128) ----
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 1}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE_M": 1}, num_warps=8, num_stages=2),
-    # ---- Large tiles (good for large M, N) ----
-    triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_SIZE_M": 1}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 1}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_SIZE_M": 1}, num_warps=8, num_stages=2),
-    # ---- Small tiles (good for small M, decode) ----
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 8}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=2),
-    # ---- num_stages=1 variants ----
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=1),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE_M": 4}, num_warps=8, num_stages=1),
-    triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 1}, num_warps=8, num_stages=1),
-    triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_SIZE_M": 1}, num_warps=8, num_stages=1),
-    triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_SIZE_M": 8}, num_warps=8, num_stages=1),
-    # ---- num_warps=4 variants ----
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 4}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 4}, num_warps=4, num_stages=2),
+    (128, 128, 64, 8, 8, 2),
+    (128, 128, 64, 4, 8, 2),
+    (128, 128, 128, 8, 8, 2),
+    (128, 128, 128, 4, 8, 2),
+    # ---- Large tiles ----
+    (256, 128, 128, 4, 8, 2),
+    (256, 128, 128, 8, 8, 2),
+    (128, 256, 64, 4, 8, 2),
+    (128, 256, 64, 8, 8, 2),
+    (128, 256, 128, 4, 8, 2),
+    (128, 256, 128, 8, 8, 2),
+    (256, 256, 64, 4, 8, 2),
+    (256, 256, 128, 4, 8, 2),
+    # ---- Small tiles ----
+    (64, 128, 64, 8, 4, 2),
+    (64, 256, 64, 4, 8, 2),
+    (64, 256, 128, 4, 8, 2),
+    # ---- num_stages=1 ----
+    (128, 128, 128, 4, 8, 1),
+    (256, 128, 128, 8, 8, 1),
+    # ---- num_warps=4 ----
+    (128, 128, 64, 4, 4, 2),
+    (128, 256, 64, 4, 4, 2),
 ]
+
+# Expand with waves_per_eu sweep (0 = driver default, 1-4 = explicit)
+LORAQ_Q8_CONFIGS = []
+for bm, bn, bk, gm, nw, ns in _BASE_CONFIGS:
+    for wpe in [0, 2, 4]:
+        LORAQ_Q8_CONFIGS.append(
+            triton.Config(
+                {"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk, "GROUP_SIZE_M": gm},
+                num_warps=nw, num_stages=ns,
+                pre_hook=None,
+            )
+        )
+# Store waves_per_eu in a parallel list (triton.Config doesn't support custom fields)
+LORAQ_Q8_WPE = []
+for bm, bn, bk, gm, nw, ns in _BASE_CONFIGS:
+    for wpe in [0, 2, 4]:
+        LORAQ_Q8_WPE.append(wpe)
 
 
 # ---------------------------------------------------------------------------
