@@ -24,7 +24,7 @@ from loraq.autotune_configs import (
     AutotunedLoRaQ, AutotunedLoRaQ3, AutotunedLoRaQFP16LR,
     AutotunedDualGEMM, AutotunedProjectAndQuant, LORAQ_Q8_CONFIGS,
 )
-from loraq.updated_kernels import (
+from loraq.kernels import (
     loraq_fused_q8_kernel, loraq_fused_q8_scaled_kernel,
     loraq_fused_q8_fp16lr_kernel,
     loraq_dual_gemm_kernel, loraq_project_and_quant_kernel,
