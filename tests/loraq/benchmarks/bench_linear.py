@@ -32,6 +32,7 @@ from loraq.autotune_configs import (
 from loraq.updated_kernels import (
     loraq_fused_q8_kernel,
     loraq_fused_q8_scaled_kernel_8_8,
+    loraq_fused_q8_scaled_kernel_8_8_RL,
     loraq_fused_q8_scaled_kernel_8_16,
     loraq_fused_q8_scaled_kernel_16_8,
     loraq_fused_q8_scaled_kernel_16_16,
@@ -45,26 +46,26 @@ from loraq.kernels import loraq_fused_q8_fp16lr_kernel
 
 SIZES = [
     # (M,     K,     N)      -- representative workloads
-    (1,     4096,  4096),    # single-token decode
-    (8,     4096,  4096),    # small batch decode
-    (32,    4096,  4096),
-    (64,    4096,  4096),
-    (128,   4096,  4096),
-    (256,   4096,  4096),
-    (512,   4096,  4096),
-    (1024,  4096,  4096),
-    (2048,  4096,  4096),
-    (4096,  4096,  4096),
-    (1,     8192,  8192),    # single-token decode
-    (8,     8192,  8192),    # small batch decode
-    (32,    8192,  8192),
-    (64,    8192,  8192),
-    (128,   8192,  8192),
-    (256,   8192,  8192),
-    (512,   8192,  8192),
-    (1024,  8192,  8192),
-    (2048,  8192,  8192),
-    (4096,  8192,  8192),
+    #(1,     4096,  4096),    # single-token decode
+    #(8,     4096,  4096),    # small batch decode
+    #(32,    4096,  4096),
+    #(64,    4096,  4096),
+    #(128,   4096,  4096),
+    #(256,   4096,  4096),
+    #(512,   4096,  4096),
+    #(1024,  4096,  4096),
+    #(2048,  4096,  4096),
+    #(4096,  4096,  4096),
+    #(1,     8192,  8192),    # single-token decode
+    #(8,     8192,  8192),    # small batch decode
+    #(32,    8192,  8192),
+    #(64,    8192,  8192),
+    #(128,   8192,  8192),
+    #(256,   8192,  8192),
+    #(512,   8192,  8192),
+    #(1024,  8192,  8192),
+    #(2048,  8192,  8192),
+    #(4096,  8192,  8192),
     #(8192,  8192,  8192),
     #(128,   4096,  11008),   # LLaMA-7B FFN up
     #(128,   11008, 4096),    # LLaMA-7B FFN down
@@ -522,22 +523,23 @@ def bench_v1_vs_loraq_autotuned(sizes):
     """
     V1 / V2 / V3 / V4 autotuned vs SVDQ autotuned — all at best configs with wpe sweep.
 
-    V1: AutotunedLoRaQ      — kernel 7    (tl.dot fp16 Phase 2, FP8 in / FP8 out)
-    V2: AutotunedLoRaQ      — kernel 8_8  (dot_scaled fp8 Phase 2, FP8 in / FP8 out)
-    V3: AutotunedLoRaQ_8_16 — kernel 8_16 (FP8 in / FP16 out, no output quant)
-    V4: AutotunedLoRaQ_16_8 — kernel 16_8 (FP16 in + channel scale / FP8 out)
-    V5: AutotunedLoRaQ_16_16 — kernel 16_16 (FP16 in / FP16 out, in-register quant)
+    V1: AutotunedLoRaQ       — kernel 7      (tl.dot fp16 Phase 2, FP8 in / FP8 out)
+    V2: AutotunedLoRaQ       — kernel 8_8    (dot_scaled fp8 Phase 2, FP8 in / FP8 out)
+    V3: AutotunedLoRaQ_8_16  — kernel 8_16   (FP8 in / FP16 out, no output quant)
+    V4: AutotunedLoRaQ_16_8  — kernel 16_8   (FP16 in + channel scale / FP8 out)
+    V5: AutotunedLoRaQ_16_16 — kernel 16_16  (FP16 in / FP16 out, in-register quant)
+    V6: AutotunedLoRaQ       — kernel 8_8_RL (Phase1=AR only, Phase2=AW+(AR)L)
     SVDQ: AutotunedProjectAndQuant + AutotunedDualGEMM (kernels 5+6)
 
-    V1-V5 share the same MXFP8 L/R and FP4 W weight tensors.
+    V1-V6 share the same MXFP8 L/R and FP4 W weight tensors.
     V4/V5 take raw fp16 A with a per-column channel scale (ones here).
     All sweep waves_per_eu in [0,1,2] via their autotuners.
     """
     rows = []
-    W = 205
+    W = 230
     print("\n" + "=" * W)
-    print("  V1 / V2 / V3 / V4 / V5 / SVDQ — all fully autotuned (wpe sweep for V1-V5)")
-    print("  V1: K7 8→8 fp16-Ph2    V2: K8_8 8→8    V3: K8_16 8→16    V4: K16_8 16→8    V5: K16_16 16→16")
+    print("  V1 / V2 / V3 / V4 / V5 / V6 / SVDQ — all fully autotuned (wpe sweep)")
+    print("  V1: K7 8→8 fp16-Ph2    V2: K8_8 8→8    V3: K8_16 8→16    V4: K16_8 16→8    V5: K16_16 16→16    V6: K8_8_RL (split loops)")
     print("  SVDQ: rank=32, fp16 L/R, kernels 5+6")
     print("=" * W)
     header = (
@@ -548,16 +550,18 @@ def bench_v1_vs_loraq_autotuned(sizes):
         f"{'V3 µs':>9} {'V3 TF':>7}  "
         f"{'V4 µs':>9} {'V4 TF':>7}  "
         f"{'V5 µs':>9} {'V5 TF':>7}  "
-        f"{'V1/SVD':>7} {'V2/SVD':>7} {'V3/SVD':>7} {'V4/SVD':>7} {'V5/SVD':>7}"
+        f"{'V6 µs':>9} {'V6 TF':>7}  "
+        f"{'V1/SVD':>7} {'V2/SVD':>7} {'V3/SVD':>7} {'V4/SVD':>7} {'V5/SVD':>7} {'V6/SVD':>7}"
     )
     print(header)
     print("-" * W)
 
-    at_v1 = AutotunedLoRaQ(loraq_fused_q8_kernel,              LORAQ_Q8_CONFIGS, warmup=5, rep=25)
-    at_v2 = AutotunedLoRaQ(loraq_fused_q8_scaled_kernel_8_8,   LORAQ_Q8_CONFIGS, warmup=5, rep=25)
+    at_v1 = AutotunedLoRaQ(loraq_fused_q8_kernel,                LORAQ_Q8_CONFIGS, warmup=5, rep=25)
+    at_v2 = AutotunedLoRaQ(loraq_fused_q8_scaled_kernel_8_8,     LORAQ_Q8_CONFIGS, warmup=5, rep=25)
     at_v3 = AutotunedLoRaQ_8_16(loraq_fused_q8_scaled_kernel_8_16,   LORAQ_Q8_CONFIGS, warmup=5, rep=25)
     at_v4 = AutotunedLoRaQ_16_8(loraq_fused_q8_scaled_kernel_16_8,   LORAQ_Q8_CONFIGS, warmup=5, rep=25)
     at_v5 = AutotunedLoRaQ_16_16(loraq_fused_q8_scaled_kernel_16_16, LORAQ_Q8_CONFIGS, warmup=5, rep=25)
+    at_v6 = AutotunedLoRaQ(loraq_fused_q8_scaled_kernel_8_8_RL,  LORAQ_Q8_CONFIGS, warmup=5, rep=25)
     at_pq = AutotunedProjectAndQuant(loraq_project_and_quant_kernel, warmup=5, rep=25)
     at_dg = AutotunedDualGEMM(loraq_dual_gemm_kernel, LORAQ_Q8_CONFIGS, warmup=5, rep=25)
 
@@ -589,9 +593,9 @@ def bench_v1_vs_loraq_autotuned(sizes):
 
         t_svd_ms = tt.do_bench(svdq_e2e, warmup=WARMUP, rep=ITERS)
 
-        # ---- V1 / V2 / V3 autotuned (share FP8 L/R weights) ----
+        # ---- V1 / V2 / V3 / V6 autotuned (share FP8 L/R weights, same call signature) ----
         w_fp4_t = v1_layer.weight_fp4.t().contiguous()
-        for at in (at_v1, at_v2, at_v3):
+        for at in (at_v1, at_v2, at_v3, at_v6):
             at(a_fp8, a_scale,
                v1_layer.R_fp8, v1_layer.R_scale,
                v1_layer.L_fp8, v1_layer.L_scale,
@@ -613,6 +617,14 @@ def bench_v1_vs_loraq_autotuned(sizes):
         )
         t_v3_ms = tt.do_bench(
             lambda: at_v3(a_fp8, a_scale,
+                          v1_layer.R_fp8, v1_layer.R_scale,
+                          v1_layer.L_fp8, v1_layer.L_scale,
+                          w_fp4_t, v1_layer.weight_scale, M, N, K),
+            warmup=WARMUP, rep=ITERS,
+        )
+
+        t_v6_ms = tt.do_bench(
+            lambda: at_v6(a_fp8, a_scale,
                           v1_layer.R_fp8, v1_layer.R_scale,
                           v1_layer.L_fp8, v1_layer.L_scale,
                           w_fp4_t, v1_layer.weight_scale, M, N, K),
@@ -651,6 +663,7 @@ def bench_v1_vs_loraq_autotuned(sizes):
         t_v3  = t_v3_ms  / 1000.0
         t_v4  = t_v4_ms  / 1000.0
         t_v5  = t_v5_ms  / 1000.0
+        t_v6  = t_v6_ms  / 1000.0
 
         tf_svd = tflops(M, N, K, t_svd)
         tf_v1  = tflops(M, N, K, t_v1)
@@ -658,12 +671,14 @@ def bench_v1_vs_loraq_autotuned(sizes):
         tf_v3  = tflops(M, N, K, t_v3)
         tf_v4  = tflops(M, N, K, t_v4)
         tf_v5  = tflops(M, N, K, t_v5)
+        tf_v6  = tflops(M, N, K, t_v6)
 
         v1_over_svd = t_svd / t_v1 if t_v1 > 0 else float("inf")
         v2_over_svd = t_svd / t_v2 if t_v2 > 0 else float("inf")
         v3_over_svd = t_svd / t_v3 if t_v3 > 0 else float("inf")
         v4_over_svd = t_svd / t_v4 if t_v4 > 0 else float("inf")
         v5_over_svd = t_svd / t_v5 if t_v5 > 0 else float("inf")
+        v6_over_svd = t_svd / t_v6 if t_v6 > 0 else float("inf")
 
         print(
             f"{M:>6} {K:>6} {N:>6}  "
@@ -673,8 +688,9 @@ def bench_v1_vs_loraq_autotuned(sizes):
             f"{us(t_v3):>8.1f}µ {tf_v3:>6.2f}  "
             f"{us(t_v4):>8.1f}µ {tf_v4:>6.2f}  "
             f"{us(t_v5):>8.1f}µ {tf_v5:>6.2f}  "
+            f"{us(t_v6):>8.1f}µ {tf_v6:>6.2f}  "
             f"{v1_over_svd:>6.2f}x {v2_over_svd:>6.2f}x {v3_over_svd:>6.2f}x "
-            f"{v4_over_svd:>6.2f}x {v5_over_svd:>6.2f}x"
+            f"{v4_over_svd:>6.2f}x {v5_over_svd:>6.2f}x {v6_over_svd:>6.2f}x"
         )
         rows.append({
             "M": M, "K": K, "N": N,
@@ -684,11 +700,13 @@ def bench_v1_vs_loraq_autotuned(sizes):
             "v3_us":   round(us(t_v3),  1), "v3_tflops":   round(tf_v3,  3),
             "v4_us":   round(us(t_v4),  1), "v4_tflops":   round(tf_v4,  3),
             "v5_us":   round(us(t_v5),  1), "v5_tflops":   round(tf_v5,  3),
+            "v6_us":   round(us(t_v6),  1), "v6_tflops":   round(tf_v6,  3),
             "v1_over_svdq": round(v1_over_svd, 3),
             "v2_over_svdq": round(v2_over_svd, 3),
             "v3_over_svdq": round(v3_over_svd, 3),
             "v4_over_svdq": round(v4_over_svd, 3),
             "v5_over_svdq": round(v5_over_svd, 3),
+            "v6_over_svdq": round(v6_over_svd, 3),
         })
 
     return rows

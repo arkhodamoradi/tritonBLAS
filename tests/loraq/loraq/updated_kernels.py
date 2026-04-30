@@ -13,6 +13,7 @@ Eleven kernels:
   9. loraq_fused_q8_scaled_kernel_8_16      -- fused FP8/FP4 LoRA+Q, in=MXFP8, out=FP16
  10. loraq_fused_q8_scaled_kernel_16_8      -- fused FP8/FP4 LoRA+Q, in=FP16,   out=MXFP8
  11. loraq_fused_q8_scaled_kernel_16_16     -- fused FP8/FP4 LoRA+Q, in=FP16,   out=FP16
+ 12. loraq_fused_q8_scaled_kernel_8_8_RL   -- K8_8 restructured: Phase1=AR only, Phase2=AW+(AR)L
 """
 
 import triton
@@ -1772,4 +1773,249 @@ def loraq_fused_q8_scaled_kernel_16_16(
     tl.store(
         C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
         c_out, mask=c_mask,
+    )
+
+
+# ===========================================================================
+# Kernel 12 -- LoRaQ 8→8 RL: Phase 1 = A×R^T only, Phase 2 = A×W^T + (AR)×L^T
+#
+#   Functionally identical to loraq_fused_q8_scaled_kernel_8_8.
+#
+#   Difference: the K-loop is split into two separate passes over A.
+#
+#   _8_8  Phase 1:  for each K-block → acc_p (A×R^T) AND acc_q (A×W^T)
+#                   peak registers: acc_p(BLOCK_M×RANK) + acc_q(BLOCK_M×BLOCK_N)
+#
+#   _8_8_RL Phase 1: for each K-block → acc_p (A×R^T) only
+#           Phase 2: quantise P → p_fp8
+#                    second K-loop (re-reads A) → acc_q (A×W^T)
+#                    dot_scaled(p_fp8, l_tile, acc=acc_q) → (AR)L folded in
+#                   peak registers: p_fp8(BLOCK_M×RANK fp8) + acc_q(BLOCK_M×BLOCK_N)
+#
+#   Trade-off: A is read twice (once for R, once for W).
+#   Benefit:   acc_p and acc_q never coexist in registers → lower peak VGPR usage.
+# ===========================================================================
+
+@triton.jit
+def loraq_fused_q8_scaled_kernel_8_8_RL(
+    # ---- FP8 activation (pre-quantized) ----
+    A_fp8_ptr,          # (M, K)     float8_e4m3fn
+    A_scale_ptr,        # (M, K//32) uint8 e8m0
+    # ---- FP8 low-rank factor R ----
+    R_fp8_ptr,          # (RANK, K)     float8_e4m3fn  (row-major)
+    R_scale_ptr,        # (RANK, K//32) uint8 e8m0
+    # ---- FP8 low-rank factor L ----
+    L_fp8_ptr,          # (N, RANK)      float8_e4m3fn
+    L_scale_ptr,        # (N, RANK//32)  uint8 e8m0
+    # ---- FP4 weight (already transposed: K//2 × N) ----
+    W_fp4_ptr,          # (K//2, N) uint8 packed e2m1
+    W_scale_ptr,        # (N, K//32) uint8 e8m0
+    # ---- optional bias ----
+    bias_ptr,           # (N,) float32  (ignored when HAS_BIAS=False)
+    # ---- channel-wise quantization scale ----
+    channel_scale_ptr,  # (N,) fp16/bf16 — per-column scale before output quant
+    # ---- outputs ----
+    C_fp8_ptr,          # (M, N)     uint8  (will be viewed as float8_e4m3fn)
+    C_scale_ptr,        # (M, N//32) uint8 e8m0
+    # ---- dimensions ----
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    # ---- strides: A_fp8 (M, K) ----
+    stride_am: tl.constexpr, stride_ak: tl.constexpr,
+    # ---- strides: A_scale (M, K//32) ----
+    stride_asm: tl.constexpr, stride_ask: tl.constexpr,
+    # ---- strides: R_fp8 (RANK, K) ----
+    stride_rr: tl.constexpr, stride_rk: tl.constexpr,
+    # ---- strides: R_scale (RANK, K//32) ----
+    stride_rsr: tl.constexpr, stride_rsk: tl.constexpr,
+    # ---- strides: L_fp8 (N, RANK) ----
+    stride_ln: tl.constexpr, stride_lr: tl.constexpr,
+    # ---- strides: L_scale (N, RANK//32) ----
+    stride_lsn: tl.constexpr, stride_lsk: tl.constexpr,
+    # ---- strides: W_fp4 (K//2, N) ----
+    stride_wk: tl.constexpr, stride_wn: tl.constexpr,
+    # ---- strides: W_scale (N, K//32) ----
+    stride_wsn: tl.constexpr, stride_wsk: tl.constexpr,
+    # ---- strides: C_fp8 (M, N) ----
+    stride_cm: tl.constexpr, stride_cn: tl.constexpr,
+    # ---- strides: C_scale (M, N//32) ----
+    stride_csm: tl.constexpr, stride_csn: tl.constexpr,
+    # ---- stride: channel_scale (N,) ----
+    stride_cs: tl.constexpr,
+    # ---- compile-time constants ----
+    HAS_BIAS: tl.constexpr,
+    RANK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """
+    Functionally identical to loraq_fused_q8_scaled_kernel_8_8 with a
+    restructured computation order that reduces peak register pressure:
+
+        Phase 1  K-loop — A×R^T only → acc_p.
+                 Only acc_p (BLOCK_M × RANK) held in registers; no acc_q.
+
+        Phase 2  Quantise acc_p → p_fp8 in-register.
+                 Second K-loop re-reads A from global memory → acc_q (A×W^T).
+                 Single dot_scaled(p_fp8, l_tile, acc=acc_q) folds (AR)×L^T in.
+
+        Phase 3  Bias + channel-wise scaling + MXFP8 output quant (identical).
+
+    Trade-off: A is read twice (once per K-loop pass).
+    Benefit:   acc_p and acc_q never coexist — peak VGPR footprint is
+               max(acc_p, p_fp8 + acc_q) instead of acc_p + acc_q.
+
+    Grid: (ceil(M/BLOCK_M) * ceil(N/BLOCK_N),)
+    """
+    SCALE_GROUP: tl.constexpr = 32
+    RANK_GROUPS: tl.constexpr = RANK // SCALE_GROUP
+
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id        = pid // num_pid_in_group
+    first_pid_m     = group_id * GROUP_SIZE_M
+    group_size_m    = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_r = tl.arange(0, RANK)
+
+    rm = offs_m % M
+    rn = offs_n % N
+
+    loop_k = tl.cdiv(K, BLOCK_K)
+
+    # ===== Phase 1 — A×R^T only (acc_q not yet allocated) ===================
+    acc_p = tl.zeros((BLOCK_M, RANK), dtype=tl.float32)
+
+    for k in range(0, loop_k):
+        k0      = k * BLOCK_K
+        offs_k  = k0 + tl.arange(0, BLOCK_K)
+        offs_kg = (k0 // SCALE_GROUP) + tl.arange(0, BLOCK_K // SCALE_GROUP)
+        s_mask  = offs_kg[None, :] < (K // SCALE_GROUP)
+
+        a_tile = tl.load(
+            A_fp8_ptr + rm[:, None] * stride_am + offs_k[None, :] * stride_ak,
+            mask=offs_k[None, :] < K, other=0.0,
+        )
+        a_scale = tl.load(
+            A_scale_ptr + rm[:, None] * stride_asm + offs_kg[None, :] * stride_ask,
+            mask=s_mask, other=0,
+        )
+        r_tile = tl.load(
+            R_fp8_ptr + offs_r[None, :] * stride_rr + offs_k[:, None] * stride_rk,
+            mask=offs_k[:, None] < K, other=0.0,
+        )
+        r_scale = tl.load(
+            R_scale_ptr + offs_r[:, None] * stride_rsr + offs_kg[None, :] * stride_rsk,
+            mask=s_mask, other=0,
+        )
+        acc_p = tl.dot_scaled(a_tile, a_scale, "e4m3",
+                              r_tile, r_scale, "e4m3",
+                              acc=acc_p, out_dtype=tl.float32)
+
+    # ===== Phase 2 — quantise P, then A×W^T K-loop, then (AR)×L^T ===========
+
+    # Quantise acc_p → p_fp8 in-register (acc_p freed after this block)
+    p_3d   = tl.reshape(acc_p, [BLOCK_M, RANK_GROUPS, SCALE_GROUP])
+    p_amax = tl.max(tl.abs(p_3d), axis=2)
+    p_amax_i = p_amax.to(tl.int32, bitcast=True)
+    p_amax_i = (p_amax_i + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
+    p_amax   = p_amax_i.to(tl.float32, bitcast=True)
+    p_scale_exp  = tl.log2(p_amax).floor() - 7
+    p_scale_exp  = tl.clamp(p_scale_exp, min=-127, max=127)
+    p_scale_e8m0 = p_scale_exp.to(tl.uint8) + 127
+    p_quant_3d   = tl.reshape(tl.exp2(-p_scale_exp), [BLOCK_M, RANK_GROUPS, 1])
+    qp_3d  = tl.clamp(p_3d * p_quant_3d, min=-448.0, max=448.0)
+    p_fp8  = tl.reshape(qp_3d, [BLOCK_M, RANK]).to(tl.float8e4nv)
+
+    # Second K-loop: re-read A, accumulate A×W^T → acc_q
+    acc_q = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, loop_k):
+        k0      = k * BLOCK_K
+        offs_k  = k0 + tl.arange(0, BLOCK_K)
+        offs_kg = (k0 // SCALE_GROUP) + tl.arange(0, BLOCK_K // SCALE_GROUP)
+        s_mask  = offs_kg[None, :] < (K // SCALE_GROUP)
+
+        a_tile = tl.load(
+            A_fp8_ptr + rm[:, None] * stride_am + offs_k[None, :] * stride_ak,
+            mask=offs_k[None, :] < K, other=0.0,
+        )
+        a_scale = tl.load(
+            A_scale_ptr + rm[:, None] * stride_asm + offs_kg[None, :] * stride_ask,
+            mask=s_mask, other=0,
+        )
+        offs_k_packed = (k0 // 2) + tl.arange(0, BLOCK_K // 2)
+        w_tile = tl.load(
+            W_fp4_ptr + offs_k_packed[:, None] * stride_wk + rn[None, :] * stride_wn,
+            mask=offs_k_packed[:, None] < (K // 2), other=0,
+        )
+        w_scale = tl.load(
+            W_scale_ptr + rn[:, None] * stride_wsn + offs_kg[None, :] * stride_wsk,
+            mask=s_mask, other=0,
+        )
+        acc_q = tl.dot_scaled(a_tile, a_scale, "e4m3",
+                              w_tile, w_scale, "e2m1",
+                              acc=acc_q, out_dtype=tl.float32)
+
+    # (AR)×L^T: fold acc_q (A×W^T) in as initial accumulator
+    l_tile = tl.load(
+        L_fp8_ptr + offs_n[None, :] * stride_ln + offs_r[:, None] * stride_lr,
+        mask=(offs_n[None, :] < N) & (offs_r[:, None] < RANK), other=0.0,
+    )
+    offs_rk = tl.arange(0, RANK_GROUPS)
+    l_scale = tl.load(
+        L_scale_ptr + offs_n[:, None] * stride_lsn + offs_rk[None, :] * stride_lsk,
+        mask=offs_n[:, None] < N, other=0,
+    )
+    result = tl.dot_scaled(p_fp8, p_scale_e8m0, "e4m3",
+                           l_tile, l_scale, "e4m3", acc=acc_q)
+
+    # ===== Phase 3 — bias + channel-wise scaling + MXFP8 quant ==============
+
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+        result = result + bias[None, :]
+
+    N_GROUPS: tl.constexpr = BLOCK_N // SCALE_GROUP
+
+    cs = tl.load(
+        channel_scale_ptr + offs_n * stride_cs,
+        mask=offs_n < N, other=1.0,
+    ).to(tl.float32)
+    result = result * cs[None, :]
+
+    result_3d = tl.reshape(result, [BLOCK_M, N_GROUPS, SCALE_GROUP])
+    amax      = tl.max(tl.abs(result_3d), axis=2)
+    amax_i = amax.to(tl.int32, bitcast=True)
+    amax_i = (amax_i + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
+    amax   = amax_i.to(tl.float32, bitcast=True)
+    scale_exp  = tl.log2(amax).floor() - 7
+    scale_exp  = tl.clamp(scale_exp, min=-127, max=127)
+    scale_e8m0 = scale_exp.to(tl.uint8) + 127
+    quant_scale_3d = tl.reshape(tl.exp2(-scale_exp), [BLOCK_M, N_GROUPS, 1])
+    qx_3d = result_3d * quant_scale_3d
+    qx    = tl.reshape(qx_3d, [BLOCK_M, BLOCK_N])
+    qx    = tl.clamp(qx, min=-448.0, max=448.0)
+
+    fp8_out = qx.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(
+        C_fp8_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+        fp8_out, mask=c_mask,
+    )
+
+    offs_ng = pid_n * N_GROUPS + tl.arange(0, N_GROUPS)
+    s_mask  = (offs_m[:, None] < M) & (offs_ng[None, :] < (N // SCALE_GROUP))
+    tl.store(
+        C_scale_ptr + offs_m[:, None] * stride_csm + offs_ng[None, :] * stride_csn,
+        scale_e8m0, mask=s_mask,
     )
