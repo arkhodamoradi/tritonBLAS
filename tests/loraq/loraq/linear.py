@@ -6,13 +6,17 @@ for the forward-pass matrix multiplication.
 
 Classes
 -------
-TritonLinear      : fp16 / bf16 linear layer  (standard precision)
-TritonLinearFP4   : MXFP4 e2m1 linear layer   (4-bit weight + online input quant)
-TritonLinearLoRA  : LoRA+Q layer  (low-rank correction + MXFP4 weight)
+TritonLinear         : fp16 / bf16 linear layer  (standard precision)
+TritonLinearFP4      : MXFP4 e2m1 linear layer   (4-bit weight + online input quant)
+TritonLinearLoRA     : LoRA+Q layer  (low-rank correction + MXFP4 weight)
 TritonLinearLoRaQ    : Fused FP8/FP4 LoRA+Q layer, Phase 2 = tl.dot fp16
 TritonLinearLoRaQFP8 : Fused FP8/FP4 LoRA+Q layer, Phase 2 = dot_scaled fp8
 TritonLinearLoRaQ3   : LoRaQ.3 — fp16 in (fused quant), fp16 out
 TritonLinearLoRaQ4   : LoRaQ.4 — split K_proj + K_main (lower register pressure)
+TritonLinearLoRaQ_8_8  : K8_8   — MXFP8 in → MXFP8 out  (dot_scaled Phase 2)
+TritonLinearLoRaQ_8_16 : K8_16  — MXFP8 in → FP16 out   (no output quant)
+TritonLinearLoRaQ_16_8 : K16_8  — FP16 in  → MXFP8 out  (in-register input quant)
+TritonLinearLoRaQ_16_16: K16_16 — FP16 in  → FP16 out   (in-register quant, no output quant)
 """
 
 import torch
@@ -36,11 +40,20 @@ from loraq.quant import (
 )
 from loraq.autotune_configs import (
     AutotunedLoRaQ,
+    AutotunedLoRaQ_8_16,
+    AutotunedLoRaQ_16_8,
+    AutotunedLoRaQ_16_16,
     AutotunedLoRaQProj,
     AutotunedLoRaQMain,
     AutotunedDualGEMM,
     AutotunedProjectAndQuant,
     LORAQ_Q8_CONFIGS,
+)
+from loraq.updated_kernels import (
+    loraq_fused_q8_scaled_kernel_8_8,
+    loraq_fused_q8_scaled_kernel_8_16,
+    loraq_fused_q8_scaled_kernel_16_8,
+    loraq_fused_q8_scaled_kernel_16_16,
 )
 
 
@@ -1386,4 +1399,238 @@ class TritonLinearLoRaQFP8(TritonLinearLoRaQ):
             f"bias={self.bias is not None}, "
             f"format=LoRaQ_FP8+FP4_scaled, "
             f"output=MXFP8"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TritonLinearLoRaQ_8_8  (MXFP8 in → MXFP8 out, dot_scaled Phase 2)
+# ---------------------------------------------------------------------------
+
+class TritonLinearLoRaQ_8_8(TritonLinearLoRaQ):
+    """
+    MXFP8 in → MXFP8 out using ``loraq_fused_q8_scaled_kernel_8_8``.
+
+    Identical interface and weight format to ``TritonLinearLoRaQFP8``; only
+    the kernel function differs (versioned name).
+    """
+
+    _autotuner_8_8: AutotunedLoRaQ | None = None
+
+    def _get_autotuner(self) -> AutotunedLoRaQ:
+        if TritonLinearLoRaQ_8_8._autotuner_8_8 is None:
+            TritonLinearLoRaQ_8_8._autotuner_8_8 = AutotunedLoRaQ(
+                loraq_fused_q8_scaled_kernel_8_8, LORAQ_Q8_CONFIGS,
+                rank=self.rank, warmup=5, rep=25,
+            )
+        return TritonLinearLoRaQ_8_8._autotuner_8_8
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"rank={self.rank}, bias={self.bias is not None}, kernel=8_8"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TritonLinearLoRaQ_8_16  (MXFP8 in → FP16 out, no output quantization)
+# ---------------------------------------------------------------------------
+
+class TritonLinearLoRaQ_8_16(TritonLinearLoRaQ):
+    """
+    MXFP8 in → FP16 out using ``loraq_fused_q8_scaled_kernel_8_16``.
+
+    Same weight format as ``TritonLinearLoRaQ`` (MXFP8 R/L, MXFP4 W).
+    The output is a single FP16 tensor — no MXFP8 output quantization,
+    no channel_scale on the output side.
+
+    Useful as the first layer in a sequence where the consumer needs FP16
+    (e.g. QKV projections feeding into attention softmax).
+    """
+
+    _autotuner_8_16: AutotunedLoRaQ_8_16 | None = None
+
+    def _get_autotuner(self) -> AutotunedLoRaQ_8_16:
+        if TritonLinearLoRaQ_8_16._autotuner_8_16 is None:
+            TritonLinearLoRaQ_8_16._autotuner_8_16 = AutotunedLoRaQ_8_16(
+                loraq_fused_q8_scaled_kernel_8_16, LORAQ_Q8_CONFIGS,
+                rank=self.rank, warmup=5, rep=25,
+            )
+        return TritonLinearLoRaQ_8_16._autotuner_8_16
+
+    def forward(
+        self,
+        a_fp8: torch.Tensor,
+        a_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        a_fp8   : (..., in_features) float8_e4m3fn
+        a_scale : (..., in_features // 32) uint8  e8m0
+
+        Returns
+        -------
+        out : (..., out_features) fp16
+        """
+        a_fp8_2d   = a_fp8.reshape(-1, self.in_features).contiguous()
+        a_scale_2d = a_scale.reshape(-1, self.in_features // 32).contiguous()
+        M, K, N    = a_fp8_2d.shape[0], self.in_features, self.out_features
+        w_fp4_t    = self.weight_fp4.t().contiguous()
+
+        out = self._get_autotuner()(
+            a_fp8_2d, a_scale_2d,
+            self.R_fp8, self.R_scale,
+            self.L_fp8, self.L_scale,
+            w_fp4_t, self.weight_scale,
+            M, N, K,
+            bias=self.bias,
+        )
+        return out.reshape(*a_fp8.shape[:-1], N)
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"rank={self.rank}, bias={self.bias is not None}, kernel=8_16"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TritonLinearLoRaQ_16_8  (FP16 in → MXFP8 out, in-register input quant)
+# ---------------------------------------------------------------------------
+
+class TritonLinearLoRaQ_16_8(TritonLinearLoRaQ):
+    """
+    FP16 in → MXFP8 out using ``loraq_fused_q8_scaled_kernel_16_8``.
+
+    Same weight format as ``TritonLinearLoRaQ`` (MXFP8 R/L, MXFP4 W).
+    The FP16 activation is quantized to MXFP8 in-register after applying
+    a per-column input channel scale.  The output is quantized to MXFP8
+    using the inherited ``channel_scale`` (out_features,) on the output side.
+
+    Useful as the output projection (e.g. O-proj after attention) where the
+    consumer stores or transmits in MXFP8.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int = 64,
+        bias: bool = True,
+        device: str | torch.device = "cuda",
+    ):
+        super().__init__(in_features, out_features, rank, bias, device)
+        # Per-column scale applied to the FP16 activation before in-register quant
+        self.register_buffer(
+            "in_channel_scale",
+            torch.ones(in_features, device=device, dtype=torch.float16),
+        )
+        # self.channel_scale (inherited, out_features,) is the output channel scale
+
+    _autotuner_16_8: AutotunedLoRaQ_16_8 | None = None
+
+    def _get_autotuner(self) -> AutotunedLoRaQ_16_8:
+        if TritonLinearLoRaQ_16_8._autotuner_16_8 is None:
+            TritonLinearLoRaQ_16_8._autotuner_16_8 = AutotunedLoRaQ_16_8(
+                loraq_fused_q8_scaled_kernel_16_8, LORAQ_Q8_CONFIGS,
+                rank=self.rank, warmup=5, rep=25,
+            )
+        return TritonLinearLoRaQ_16_8._autotuner_16_8
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Parameters
+        ----------
+        x : (..., in_features) fp16/bf16
+
+        Returns
+        -------
+        c_fp8   : (..., out_features) float8_e4m3fn
+        c_scale : (..., out_features // 32) uint8  e8m0
+        """
+        x_2d = x.reshape(-1, self.in_features)
+        if x_2d.dtype != torch.float16:
+            x_2d = x_2d.to(torch.float16)
+        x_2d    = x_2d.contiguous()
+        M, K, N = x_2d.shape[0], self.in_features, self.out_features
+        w_fp4_t = self.weight_fp4.t().contiguous()
+
+        c_fp8, c_scale = self._get_autotuner()(
+            x_2d, self.in_channel_scale, self.channel_scale,
+            self.R_fp8, self.R_scale,
+            self.L_fp8, self.L_scale,
+            w_fp4_t, self.weight_scale,
+            M, N, K,
+            bias=self.bias,
+        )
+        return c_fp8.reshape(*x.shape[:-1], N), c_scale.reshape(*x.shape[:-1], N // 32)
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"rank={self.rank}, bias={self.bias is not None}, kernel=16_8"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TritonLinearLoRaQ_16_16  (FP16 in → FP16 out, in-register input quant)
+# ---------------------------------------------------------------------------
+
+class TritonLinearLoRaQ_16_16(TritonLinearLoRaQ_16_8):
+    """
+    FP16 in → FP16 out using ``loraq_fused_q8_scaled_kernel_16_16``.
+
+    Inherits the ``in_channel_scale`` buffer and ``from_float`` factory from
+    ``TritonLinearLoRaQ_16_8``.  The FP16 activation is quantized to MXFP8
+    in-register before dot_scaled; the output is stored as FP16 directly
+    with no output quantization.
+
+    Activation tensors between stacked layers remain FP16 — no explicit
+    quant/dequant kernel launches at layer boundaries.
+    """
+
+    _autotuner_16_16: AutotunedLoRaQ_16_16 | None = None
+
+    def _get_autotuner(self) -> AutotunedLoRaQ_16_16:
+        if TritonLinearLoRaQ_16_16._autotuner_16_16 is None:
+            TritonLinearLoRaQ_16_16._autotuner_16_16 = AutotunedLoRaQ_16_16(
+                loraq_fused_q8_scaled_kernel_16_16, LORAQ_Q8_CONFIGS,
+                rank=self.rank, warmup=5, rep=25,
+            )
+        return TritonLinearLoRaQ_16_16._autotuner_16_16
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x : (..., in_features) fp16/bf16
+
+        Returns
+        -------
+        out : (..., out_features) fp16
+        """
+        x_2d = x.reshape(-1, self.in_features)
+        if x_2d.dtype != torch.float16:
+            x_2d = x_2d.to(torch.float16)
+        x_2d    = x_2d.contiguous()
+        M, K, N = x_2d.shape[0], self.in_features, self.out_features
+        w_fp4_t = self.weight_fp4.t().contiguous()
+
+        out = self._get_autotuner()(
+            x_2d, self.in_channel_scale,
+            self.R_fp8, self.R_scale,
+            self.L_fp8, self.L_scale,
+            w_fp4_t, self.weight_scale,
+            M, N, K,
+            bias=self.bias,
+        )
+        return out.reshape(*x.shape[:-1], N)
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"rank={self.rank}, bias={self.bias is not None}, kernel=16_16"
         )
