@@ -18,11 +18,13 @@ _TORCH_TO_TL_DTYPE = {
 # HW instruction to use for each (format, out_dtype) combination
 _FP8E4_ASM = {
     torch.float32:  "v_cvt_scalef32_f32_fp8",
-    torch.float16:  "v_cvt_scalef32_f16_fp8",
+    torch.float16:  "v_cvt_scalef32_pk_f16_fp8",
+    torch.bfloat16: "v_cvt_scalef32_pk_bf16_fp8",
 }
 _FP8E5_ASM = {
     torch.float32:  "v_cvt_scalef32_f32_bf8",
-    torch.float16:  "v_cvt_scalef32_f16_bf8",
+    torch.float16:  "v_cvt_scalef32_pk_f16_bf8",
+    torch.bfloat16: "v_cvt_scalef32_pk_bf16_bf8",
 }
 # FP4: f32 path is hard-coded in the kernel; only 16-bit variants go via ASM_INSTR
 _FP4_ASM = {
@@ -114,10 +116,15 @@ def mxfp8e4_to_f32_kernel_hw(
             ASM_INSTR + " $0, $1, $2", "=v,v,v",
             args=[fp8_u32, scale_f32], dtype=tl.float32, is_pure=True, pack=1,
         )
-    else:  # float16
+    elif OUT_DTYPE == tl.float16:
         result = tl.inline_asm_elementwise(
             ASM_INSTR + " $0, $1, $2", "=v,v,v",
             args=[fp8_u32, scale_f32], dtype=tl.float16, is_pure=True, pack=1,
+        )
+    else:  # bfloat16
+        result = tl.inline_asm_elementwise(
+            ASM_INSTR + " $0, $1, $2", "=v,v,v",
+            args=[fp8_u32, scale_f32], dtype=tl.bfloat16, is_pure=True, pack=1,
         )
 
     out_ptrs = out_ptr + pid_m * stride_out_m + fp8_indices * stride_out_k
@@ -197,10 +204,15 @@ def mxfp8e5_to_f32_kernel_hw(
             ASM_INSTR + " $0, $1, $2", "=v,v,v",
             args=[fp8_u32, scale_f32], dtype=tl.float32, is_pure=True, pack=1,
         )
-    else:  # float16
+    elif OUT_DTYPE == tl.float16:
         result = tl.inline_asm_elementwise(
             ASM_INSTR + " $0, $1, $2", "=v,v,v",
             args=[fp8_u32, scale_f32], dtype=tl.float16, is_pure=True, pack=1,
+        )
+    else:  # bfloat16
+        result = tl.inline_asm_elementwise(
+            ASM_INSTR + " $0, $1, $2", "=v,v,v",
+            args=[fp8_u32, scale_f32], dtype=tl.bfloat16, is_pure=True, pack=1,
         )
 
     out_ptrs = out_ptr + pid_m * stride_out_m + fp8_indices * stride_out_k
@@ -382,7 +394,7 @@ def mxfp8_to_f32_triton_hw(
     else:
         kernel = mxfp8e5_to_f32_kernel_hw
         asm_map = _FP8E5_ASM
-    assert out_dtype in asm_map, f"No HW instruction for FP8 {fmt} → {out_dtype}"
+    assert out_dtype in asm_map, f"No HW instruction for FP8 {fmt} → {out_dtype} (supported: {list(asm_map.keys())})"
 
     kernel[grid](
         fp8_data, scales, out,
