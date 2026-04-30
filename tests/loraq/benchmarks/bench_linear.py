@@ -27,7 +27,7 @@ from loraq.linear import (
 from loraq.quant import dynamic_mxfp8_quant, dynamic_mxfp4_quant
 from loraq.autotune_configs import (
     AutotunedLoRaQ, AutotunedLoRaQ_8_16, AutotunedLoRaQ_16_8, AutotunedLoRaQ_16_16,
-    AutotunedLoRaQ3, AutotunedDualGEMM, AutotunedProjectAndQuant, LORAQ_Q8_CONFIGS,
+    AutotunedLoRaQ3, AutotunedLoRaQFP16LR, AutotunedDualGEMM, AutotunedProjectAndQuant, LORAQ_Q8_CONFIGS,
 )
 from loraq.updated_kernels import (
     loraq_fused_q8_kernel,
@@ -37,6 +37,7 @@ from loraq.updated_kernels import (
     loraq_fused_q8_scaled_kernel_16_16,
     loraq_dual_gemm_kernel, loraq_project_and_quant_kernel,
 )
+from loraq.kernels import loraq_fused_q8_fp16lr_kernel
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -44,16 +45,27 @@ from loraq.updated_kernels import (
 
 SIZES = [
     # (M,     K,     N)      -- representative workloads
-    #(1,     4096,  4096),    # single-token decode
-    #(8,     4096,  4096),    # small batch decode
-    #(32,    4096,  4096),
-    #(64,    4096,  4096),
-    #(128,   4096,  4096),
-    #(256,   4096,  4096),
-    #(512,   4096,  4096),
-    #(1024,  4096,  4096),
-    #(2048,  4096,  4096),
-    #(4096,  4096,  4096),
+    (1,     4096,  4096),    # single-token decode
+    (8,     4096,  4096),    # small batch decode
+    (32,    4096,  4096),
+    (64,    4096,  4096),
+    (128,   4096,  4096),
+    (256,   4096,  4096),
+    (512,   4096,  4096),
+    (1024,  4096,  4096),
+    (2048,  4096,  4096),
+    (4096,  4096,  4096),
+    (1,     8192,  8192),    # single-token decode
+    (8,     8192,  8192),    # small batch decode
+    (32,    8192,  8192),
+    (64,    8192,  8192),
+    (128,   8192,  8192),
+    (256,   8192,  8192),
+    (512,   8192,  8192),
+    (1024,  8192,  8192),
+    (2048,  8192,  8192),
+    (4096,  8192,  8192),
+    #(8192,  8192,  8192),
     #(128,   4096,  11008),   # LLaMA-7B FFN up
     #(128,   11008, 4096),    # LLaMA-7B FFN down
     #(128,   5120,  5120),    # LLaMA-13B hidden
@@ -70,7 +82,7 @@ SIZES = [
     (4096,3072,3072),
     (4096,12288,3072),
     (4096,3072,12288),
-    (4096,  4096,  4096),    # large batch
+    #(4096,  4096,  4096),    # large batch
 ]
 
 WARMUP = 25
@@ -994,34 +1006,30 @@ def bench_svdq_vs_loraq_pixarts_tblock():
     for M in PIXART_SEQ_LENS:
         x = torch.randn(M, hidden, device=dev, dtype=dtype)
 
-        # ---- SVDQ forward ----
         def svdq_fwd():
             h    = norm1(x)
-            qkv  = qkv_svdq(h)                    # (M, 3*hidden) fp16
-            v    = qkv[:, 2 * hidden:]             # mock attn: use V directly
-            o    = o_svdq(v)                       # (M, hidden) fp16
+            qkv  = qkv_svdq(h)
+            v    = qkv[:, 2 * hidden:]
+            o    = o_svdq(v)
             r    = x + o
             h2   = norm2(r)
-            u    = up_svdq(h2)                     # (M, ffn_dim) fp16
+            u    = up_svdq(h2)
             u    = F.gelu(u)
-            d    = dn_svdq(u)                      # (M, hidden) fp16
+            d    = dn_svdq(u)
             return r + d
 
-        # ---- LoRaQ-Mixed forward (all 16→16, no explicit quant/dequant between layers) ----
         def loraq_fwd():
             h   = norm1(x)
-            qkv = qkv_lq(h)                # (M, 3*hidden) fp16
-            v   = qkv[:, 2 * hidden:]      # mock attn: use V directly
-            o   = o_lq(v)                  # (M, hidden) fp16
+            qkv = qkv_lq(h)
+            v   = qkv[:, 2 * hidden:]
+            o   = o_lq(v)
             r   = x + o
-
             h2  = norm2(r)
-            u   = up_lq(h2)                # (M, ffn_dim) fp16
+            u   = up_lq(h2)
             u   = F.gelu(u)
-            d   = dn_lq(u)                 # (M, hidden) fp16
+            d   = dn_lq(u)
             return r + d
 
-        # Warmup (also triggers autotuning for all shapes)
         _ = svdq_fwd()
         _ = loraq_fwd()
 
@@ -1047,6 +1055,106 @@ def bench_svdq_vs_loraq_pixarts_tblock():
 
 
 # ---------------------------------------------------------------------------
+# LoRaQ.6 (fp16 L,R) vs LoRaQ.1 (fp8 L,R) comparison
+# ---------------------------------------------------------------------------
+
+def bench_loraq_fp16lr(sizes):
+    """
+    LoRaQ.6 (K13: fp16 L,R, dequant A in low-rank branch) vs LoRaQ.1 (K7: fp8 L,R).
+    Both autotuned. Measures overhead of using fp16 L/R vs fp8 L/R.
+    """
+    rows = []
+    W = 85
+    print("\n" + "=" * W)
+    print("  LoRaQ.6 (fp16 L,R) vs LoRaQ.1 (fp8 L,R)  — autotuned")
+    print("  LoRaQ.6: K13, dequant A→fp16 for A×R^T, L loaded as fp16")
+    print("  LoRaQ.1: K7, dot_scaled for A×R^T, L dequanted from fp8")
+    print("=" * W)
+    header = (
+        f"{'M':>6} {'K':>6} {'N':>6}  "
+        f"{'LoRaQ.1 µs':>12}  "
+        f"{'LoRaQ.6 µs':>12}  "
+        f"{'LoRaQ.6/LoRaQ.1':>17}"
+    )
+    print(header)
+    print("-" * W)
+
+    at_v1 = AutotunedLoRaQ(loraq_fused_q8_kernel, LORAQ_Q8_CONFIGS, warmup=5, rep=25)
+    at_v6 = AutotunedLoRaQFP16LR(loraq_fused_q8_fp16lr_kernel, LORAQ_Q8_CONFIGS, warmup=5, rep=25)
+
+    for M, K, N in sizes:
+        if K % 64 != 0 or N % 32 != 0:
+            continue
+
+        x = torch.randn(M, K, device="cuda", dtype=torch.float16)
+        a_fp8, a_scale = dynamic_mxfp8_quant(x)
+        ref_linear = nn.Linear(K, N, bias=False, device="cuda", dtype=torch.float16)
+
+        v1_layer = TritonLinearLoRaQ.from_float(ref_linear)
+
+        from loraq.quant import dynamic_mxfp4_quant, mxfp4_to_f32, e8m0_to_f32
+        W_full = ref_linear.weight.to(torch.float16)
+        w_fp4, w_scale_q = dynamic_mxfp4_quant(W_full)
+        w_deq = mxfp4_to_f32(w_fp4)
+        s_f32 = e8m0_to_f32(w_scale_q).repeat_interleave(32, dim=-1)
+        w_recon = (w_deq * s_f32).to(torch.float16).to("cuda")
+        residual = (W_full - w_recon).float()
+        U, S, Vh = torch.linalg.svd(residual, full_matrices=False)
+        rank = 64
+        sqrt_S = S[:rank].sqrt()
+        L_fp16 = (U[:, :rank] * sqrt_S[None, :]).to(torch.float16).contiguous()
+        R_fp16 = (sqrt_S[:, None] * Vh[:rank, :]).to(torch.float16).contiguous()
+
+        w_fp4_t = v1_layer.weight_fp4.t().contiguous()
+        channel_scale = torch.ones(N, dtype=torch.float16, device="cuda")
+
+        _ = at_v1(a_fp8, a_scale,
+                  v1_layer.R_fp8, v1_layer.R_scale,
+                  v1_layer.L_fp8, v1_layer.L_scale,
+                  w_fp4_t, v1_layer.weight_scale, M, N, K)
+        t_v1_ms = tt.do_bench(
+            lambda: at_v1(
+                a_fp8, a_scale,
+                v1_layer.R_fp8, v1_layer.R_scale,
+                v1_layer.L_fp8, v1_layer.L_scale,
+                w_fp4_t, v1_layer.weight_scale, M, N, K,
+            ),
+            warmup=WARMUP, rep=ITERS,
+        )
+        t_v1 = t_v1_ms / 1000.0
+
+        _ = at_v6(a_fp8, a_scale, R_fp16, L_fp16,
+                  w_fp4_t, v1_layer.weight_scale, M, N, K,
+                  channel_scale=channel_scale)
+        t_v6_ms = tt.do_bench(
+            lambda: at_v6(
+                a_fp8, a_scale, R_fp16, L_fp16,
+                w_fp4_t, v1_layer.weight_scale, M, N, K,
+                channel_scale=channel_scale,
+            ),
+            warmup=WARMUP, rep=ITERS,
+        )
+        t_v6 = t_v6_ms / 1000.0
+
+        v6_ratio = t_v6 / t_v1 if t_v1 > 0 else float("inf")
+
+        print(
+            f"{M:>6} {K:>6} {N:>6}  "
+            f"{us(t_v1):>11.1f}µ  "
+            f"{us(t_v6):>11.1f}µ  "
+            f"{v6_ratio:>16.2f}x"
+        )
+        rows.append({
+            "M": M, "K": K, "N": N,
+            "v1_tuned_us": round(us(t_v1), 1),
+            "v6_tuned_us": round(us(t_v6), 1),
+            "v6_ratio":    round(v6_ratio, 3),
+        })
+
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1064,6 +1172,7 @@ def main():
     parser.add_argument("--loraq3-only",  action="store_true", help="LoRaQ.3 (fp16io) vs LoRaQ.1 comparison")
     parser.add_argument("--svdq-vs-loraq-pixarts-tblock", action="store_true",
                         help="SVDQ vs LoRaQ-Mixed end-to-end Pixart-σ transformer block")
+    parser.add_argument("--loraq-fp16lr", action="store_true", help="LoRaQ.6 (fp16 L,R) vs LoRaQ.1 comparison")
     args = parser.parse_args()
 
     results = {}
@@ -1075,6 +1184,7 @@ def main():
         or args.v1_vs_loraq_wallclock
         or args.loraq3_only
         or args.svdq_vs_loraq_pixarts_tblock
+        or args.loraq_fp16lr
     )
 
     if run_all or args.fp_only:
@@ -1106,6 +1216,9 @@ def main():
 
     if run_all or args.svdq_vs_loraq_pixarts_tblock:
         results["svdq_vs_loraq_pixarts_tblock"] = bench_svdq_vs_loraq_pixarts_tblock()
+
+    if args.loraq_fp16lr:
+        results["loraq_fp16lr"] = bench_loraq_fp16lr(SIZES)
 
     if args.json:
         with open(args.json, "w") as f:

@@ -31,6 +31,7 @@ from loraq.autotune_configs import (
 )
 from loraq.kernels import (
     loraq_fused_q8_kernel, loraq_fused_q8_scaled_kernel,
+    loraq_fused_q8_hwquant_kernel,
     loraq_dual_gemm_kernel, loraq_project_and_quant_kernel
 )
 
@@ -218,11 +219,12 @@ def profile_loraq1(M, K, N, warmup=25, iters=100):
     # Get best config
     best = at.get_best_config(M, N, K)
     cfg = best["config"] if best else None
+    wpe = best.get("waves_per_eu", "?") if best else "?"
     cfg_str = "?"
     if cfg:
         cfg_str = (f"BM={cfg.kwargs['BLOCK_M']}, BN={cfg.kwargs['BLOCK_N']}, "
                    f"BK={cfg.kwargs['BLOCK_K']}, GM={cfg.kwargs['GROUP_SIZE_M']}, "
-                   f"warps={cfg.num_warps}, stages={cfg.num_stages}")
+                   f"warps={cfg.num_warps}, stages={cfg.num_stages}, wpe={wpe}")
 
     # Find .amdgcn by kernel function name (most recent = best config)
     amdgcn_files = find_amdgcn_by_name("loraq_fused_q8_kernel")
@@ -263,11 +265,12 @@ def profile_loraq2(M, K, N, warmup=25, iters=100):
 
     best = at.get_best_config(M, N, K)
     cfg = best["config"] if best else None
+    wpe = best.get("waves_per_eu", "?") if best else "?"
     cfg_str = "?"
     if cfg:
         cfg_str = (f"BM={cfg.kwargs['BLOCK_M']}, BN={cfg.kwargs['BLOCK_N']}, "
                    f"BK={cfg.kwargs['BLOCK_K']}, GM={cfg.kwargs['GROUP_SIZE_M']}, "
-                   f"warps={cfg.num_warps}, stages={cfg.num_stages}")
+                   f"warps={cfg.num_warps}, stages={cfg.num_stages}, wpe={wpe}")
 
     amdgcn_files = find_amdgcn_by_name("loraq_fused_q8_scaled_kernel")
     metadata = parse_amdgcn_metadata(amdgcn_files[0]) if amdgcn_files else {}
@@ -277,6 +280,44 @@ def profile_loraq2(M, K, N, warmup=25, iters=100):
         "config": cfg_str,
         "metadata": metadata,
         "amdgcn_file": amdgcn_files[0] if amdgcn_files else None,
+    }
+
+
+def profile_loraq_k9(M, K, N, warmup=25, iters=100):
+    """Profile autotuned K9 (HW fp8 quant via v_cvt_scalef32_pk_fp8_f16)."""
+    x = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    a_fp8, a_scale = dynamic_mxfp8_quant(x)
+    ref = nn.Linear(K, N, bias=False, device="cuda", dtype=torch.float16)
+    layer = TritonLinearLoRaQ.from_float(ref)
+    w_fp4_t = layer.weight_fp4.t().contiguous()
+
+    at = AutotunedLoRaQ(loraq_fused_q8_hwquant_kernel, LORAQ_Q8_CONFIGS, warmup=5, rep=25)
+
+    _ = at(a_fp8, a_scale, layer.R_fp8, layer.R_scale,
+           layer.L_fp8, layer.L_scale, w_fp4_t, layer.weight_scale, M, N, K)
+    torch.cuda.synchronize()
+
+    t_ms = tt.do_bench(
+        lambda: at(a_fp8, a_scale, layer.R_fp8, layer.R_scale,
+                   layer.L_fp8, layer.L_scale, w_fp4_t, layer.weight_scale, M, N, K),
+        warmup=warmup, rep=iters,
+    )
+
+    best = at.get_best_config(M, N, K)
+    cfg = best["config"] if best else None
+    cfg_str = "?"
+    if cfg:
+        cfg_str = (f"BM={cfg.kwargs['BLOCK_M']}, BN={cfg.kwargs['BLOCK_N']}, "
+                   f"BK={cfg.kwargs['BLOCK_K']}, GM={cfg.kwargs['GROUP_SIZE_M']}, "
+                   f"warps={cfg.num_warps}, stages={cfg.num_stages}")
+
+    amdgcn_files = find_amdgcn_by_name("loraq_fused_q8_hwquant_kernel")
+    metadata = parse_amdgcn_metadata(amdgcn_files[0]) if amdgcn_files else {}
+
+    return {
+        "time_us": t_ms * 1000.0,
+        "config": cfg_str,
+        "metadata": metadata,
     }
 
 
@@ -391,7 +432,6 @@ def run_profile(M, K, N):
         r2_loraq["time_us"], r2_loraq["config"], r2_loraq["metadata"],
     )
 
-
     # ---- SVDQuant ----
     print("  Profiling SVDQuant (Kernels 5+6) ...")
     r2 = profile_svdquant(M, K, N)
@@ -448,6 +488,8 @@ def main():
                         metavar=("M", "K", "N"), help="Problem size")
     parser.add_argument("--all-sizes", action="store_true",
                         help="Profile multiple sizes")
+    parser.add_argument("--breakdown", action="store_true",
+                        help="K8 breakdown: profile each GEMM path separately")
     args = parser.parse_args()
 
     torch.manual_seed(42)
@@ -467,8 +509,162 @@ def main():
         if K % 64 != 0 or N % 32 != 0:
             print(f"  Skipping ({M}, {K}, {N}): K must be % 64, N must be % 32")
             continue
-        run_profile(M, K, N)
+        if args.breakdown:
+            run_k8_breakdown(M, K, N)
+        else:
+            run_profile(M, K, N)
+
+
+def run_k8_breakdown(M, K, N):
+    """Profile K8 split into 3 kernels: low-rank, residual, sum+quant."""
+    from loraq.kernels import (
+        loraq_lowrank_branch_kernel,
+        loraq_lowrank_branch_v1_kernel,
+        loraq_residual_branch_kernel,
+        loraq_sum_quant_kernel,
+    )
+
+    W = 90
+    print(f"\n{'=' * W}")
+    print(f"  K8 Path Breakdown: M={M}, K={K}, N={N}")
+    print(f"  3-kernel split: low-rank | residual | sum+quant")
+    print(f"{'=' * W}\n")
+
+    x = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    a_fp8, a_scale = dynamic_mxfp8_quant(x)
+    ref = nn.Linear(K, N, bias=False, device="cuda", dtype=torch.float16)
+    layer = TritonLinearLoRaQ.from_float(ref)
+    w_fp4_t = layer.weight_fp4.t().contiguous()
+    rank = 64
+
+    # Autotune configs: (BM, BN, BK, GM, warps, stages, waves_per_eu)
+    BREAKDOWN_CONFIGS = []
+    for bm, bn, bk in [(128, 128, 64), (128, 128, 128), (128, 256, 64), (128, 256, 128), (256, 128, 128)]:
+        for gm in [4, 8]:
+            for nw in [4, 8]:
+                for wpe in [0, 1, 2, 3, 4]:
+                    BREAKDOWN_CONFIGS.append((bm, bn, bk, gm, nw, 2, wpe))
+
+    def _sweep_kernel(name, launch_fn, configs):
+        """Mini-sweep: try all configs, return (best_time_us, best_cfg_str)."""
+        best_ms, best_cfg = float("inf"), configs[0]
+        for cfg in configs:
+            try:
+                launch_fn(*cfg)
+                torch.cuda.synchronize()
+                ms = tt.do_bench(lambda c=cfg: launch_fn(*c), warmup=10, rep=50)
+                if ms < best_ms:
+                    best_ms, best_cfg = ms, cfg
+            except Exception:
+                continue
+        return best_ms * 1000.0, f"BM={best_cfg[0]},BN={best_cfg[1]},BK={best_cfg[2]},GM={best_cfg[3]},w={best_cfg[4]},wpe={best_cfg[6]}"
+
+    # Outputs
+    C_lr = torch.empty((M, N), dtype=torch.float16, device="cuda")
+    C_res = torch.empty((M, N), dtype=torch.float16, device="cuda")
+    C_fp8 = torch.empty((M, N), dtype=torch.uint8, device="cuda")
+    C_scale = torch.empty((M, N // 32), dtype=torch.uint8, device="cuda")
+
+    # ---- 1. Low-rank branch K8-style (autotuned) ----
+    print("  1. LOW-RANK BRANCH K8-style (autotuned: A×R^T → quant(P) → P×L^T)")
+    def _lr_launch(bm, bn, bk, gm, nw, ns, wpe):
+        grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+        loraq_lowrank_branch_kernel[grid](
+            a_fp8, a_scale, layer.R_fp8, layer.R_scale,
+            layer.L_fp8, layer.L_scale, C_lr, M, N, K,
+            a_fp8.stride(0), a_fp8.stride(1), a_scale.stride(0), a_scale.stride(1),
+            layer.R_fp8.stride(0), layer.R_fp8.stride(1), layer.R_scale.stride(0), layer.R_scale.stride(1),
+            layer.L_fp8.stride(0), layer.L_fp8.stride(1), layer.L_scale.stride(0), layer.L_scale.stride(1),
+            C_lr.stride(0), C_lr.stride(1),
+            RANK=rank, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_SIZE_M=gm,
+            num_warps=nw, num_stages=ns, matrix_instr_nonkdim=32, waves_per_eu=wpe,
+        )
+    t_lr, cfg_lr = _sweep_kernel("lowrank_k8", _lr_launch, BREAKDOWN_CONFIGS)
+    amdgcn = find_amdgcn_by_name("loraq_lowrank_branch_kernel")
+    meta_lr = parse_amdgcn_metadata(amdgcn[0]) if amdgcn else {}
+    print_kernel_stats("Low-rank K8-style (autotuned)", t_lr, cfg_lr, meta_lr)
+
+    # ---- 1b. Low-rank branch K7-style (autotuned) ----
+    print("  1b. LOW-RANK BRANCH K7-style (autotuned: fp16 P×L^T)")
+    def _lr_v1_launch(bm, bn, bk, gm, nw, ns, wpe):
+        grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+        loraq_lowrank_branch_v1_kernel[grid](
+            a_fp8, a_scale, layer.R_fp8, layer.R_scale,
+            layer.L_fp8, layer.L_scale, C_lr, M, N, K,
+            a_fp8.stride(0), a_fp8.stride(1), a_scale.stride(0), a_scale.stride(1),
+            layer.R_fp8.stride(0), layer.R_fp8.stride(1), layer.R_scale.stride(0), layer.R_scale.stride(1),
+            layer.L_fp8.stride(0), layer.L_fp8.stride(1), layer.L_scale.stride(0), layer.L_scale.stride(1),
+            C_lr.stride(0), C_lr.stride(1),
+            RANK=rank, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_SIZE_M=gm,
+            num_warps=nw, num_stages=ns, matrix_instr_nonkdim=32, waves_per_eu=wpe,
+        )
+    t_lr_v1, cfg_lr_v1 = _sweep_kernel("lowrank_k7", _lr_v1_launch, BREAKDOWN_CONFIGS)
+    amdgcn_v1 = find_amdgcn_by_name("loraq_lowrank_branch_v1_kernel")
+    meta_lr_v1 = parse_amdgcn_metadata(amdgcn_v1[0]) if amdgcn_v1 else {}
+    print_kernel_stats("Low-rank K7-style (autotuned)", t_lr_v1, cfg_lr_v1, meta_lr_v1)
+
+    # ---- 2. Residual branch (autotuned) ----
+    print("  2. RESIDUAL BRANCH (autotuned: A_fp8 × W_fp4^T → fp16)")
+    def _res_launch(bm, bn, bk, gm, nw, ns, wpe):
+        grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+        loraq_residual_branch_kernel[grid](
+            a_fp8, a_scale, w_fp4_t, layer.weight_scale, C_res, M, N, K,
+            a_fp8.stride(0), a_fp8.stride(1), a_scale.stride(0), a_scale.stride(1),
+            w_fp4_t.stride(0), w_fp4_t.stride(1), layer.weight_scale.stride(0), layer.weight_scale.stride(1),
+            C_res.stride(0), C_res.stride(1),
+            BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_SIZE_M=gm,
+            num_warps=nw, num_stages=ns, matrix_instr_nonkdim=32, waves_per_eu=wpe,
+        )
+    t_res, cfg_res = _sweep_kernel("residual", _res_launch, BREAKDOWN_CONFIGS)
+    amdgcn = find_amdgcn_by_name("loraq_residual_branch_kernel")
+    meta_res = parse_amdgcn_metadata(amdgcn[0]) if amdgcn else {}
+    print_kernel_stats("Residual branch (autotuned)", t_res, cfg_res, meta_res)
+
+    # ---- 3. Sum + MXFP8 quant (fixed config, simple kernel) ----
+    print("  3. SUM + MXFP8 QUANT")
+    SQ_BM, SQ_BN = 128, 128
+    grid_sq = (triton.cdiv(M, SQ_BM), triton.cdiv(N, SQ_BN))
+    def run_sum_quant():
+        loraq_sum_quant_kernel[grid_sq](
+            C_lr, C_res, C_fp8, C_scale, M, N,
+            C_lr.stride(0), C_lr.stride(1), C_res.stride(0), C_res.stride(1),
+            C_fp8.stride(0), C_fp8.stride(1), C_scale.stride(0), C_scale.stride(1),
+            BLOCK_M=SQ_BM, BLOCK_N=SQ_BN,
+        )
+    run_sum_quant()
+    torch.cuda.synchronize()
+    t_sq = tt.do_bench(run_sum_quant, warmup=25, rep=100) * 1000.0
+    amdgcn = find_amdgcn_by_name("loraq_sum_quant_kernel")
+    meta_sq = parse_amdgcn_metadata(amdgcn[0]) if amdgcn else {}
+    print_kernel_stats("Sum + quant", t_sq, f"BM={SQ_BM},BN={SQ_BN}", meta_sq)
+
+    # ---- 4. Fused baselines ----
+    print("  4. FUSED BASELINES")
+    r7 = profile_loraq1(M, K, N)
+    print_kernel_stats("K7 fused (LoRaQ.1)", r7["time_us"], r7["config"], r7["metadata"])
+    r8 = profile_loraq2(M, K, N)
+    print_kernel_stats("K8 fused (LoRaQ.2)", r8["time_us"], r8["config"], r8["metadata"])
+
+    # ---- Summary ----
+    t_sum_total = t_lr + t_res + t_sq
+    print(f"  {'─' * 70}")
+    print(f"  3-Kernel Split Summary:")
+    print(f"    K_lowrank K8: {t_lr:>7.1f} µs  VGPRs={meta_lr.get('total_num_vgprs','?'):<4}  occ={meta_lr.get('occupancy','?')}  (dot_scaled P×L^T)")
+    print(f"    K_lowrank K7: {t_lr_v1:>7.1f} µs  VGPRs={meta_lr_v1.get('total_num_vgprs','?'):<4}  occ={meta_lr_v1.get('occupancy','?')}  (fp16 dot P×L^T)")
+    print(f"    K_residual:   {t_res:>7.1f} µs  VGPRs={meta_res.get('total_num_vgprs','?'):<4}  occ={meta_res.get('occupancy','?')}")
+    print(f"    K_sum_quant:  {t_sq:>7.1f} µs  VGPRs={meta_sq.get('total_num_vgprs','?'):<4}  occ={meta_sq.get('occupancy','?')}")
+    print(f"    ────────────────────────────")
+    t_sum_v1 = t_lr_v1 + t_res + t_sq
+    print(f"    Sum (K8-style): {t_sum_total:>6.1f} µs")
+    print(f"    Sum (K7-style): {t_sum_v1:>6.1f} µs")
+    print(f"    K7 fused:      {r7['time_us']:>6.1f} µs  VGPRs={r7['metadata'].get('total_num_vgprs','?'):<4}  occ={r7['metadata'].get('occupancy','?')}")
+    print(f"    K8 fused:      {r8['time_us']:>6.1f} µs  VGPRs={r8['metadata'].get('total_num_vgprs','?'):<4}  occ={r8['metadata'].get('occupancy','?')}")
+    overhead = t_sum_total - r8['time_us']
+    print(f"")
+    print(f"  Split overhead: {overhead:+.1f} µs ({overhead/r8['time_us']*100:+.1f}%)")
+    print(f"  Split reads A_fp8 twice and adds kernel launch + sum+quant overhead.\n")
 
 
 if __name__ == "__main__":
+    print("This benchmark extracts kernel statistics from AMDGCN assembly files generated by Triton autotuning.")
     main()
