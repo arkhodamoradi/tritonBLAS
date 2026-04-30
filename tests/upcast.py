@@ -652,6 +652,7 @@ def mxfp6e2_to_f32_kernel_hw(
     stride_scale_g,  # Group stride for scales
     stride_out_m,    # Row stride for output
     GROUP_SIZE: tl.constexpr,  # Must be 32
+    GROUPS_PER_BLOCK: tl.constexpr = 1,
     OUT_DTYPE: tl.constexpr = tl.float32,
     ASM_INSTR: tl.constexpr = "v_cvt_scalef32_pk32_f16_fp6",
 ):
@@ -659,190 +660,167 @@ def mxfp6e2_to_f32_kernel_hw(
     Hardware-accelerated MXFP6 E2M3 upcast kernel.
     f32 path: hard-coded v_cvt_scalef32_pk32_f32_fp6 (32 VGPRs → 32×f32).
     f16/bf16 path: ASM_INSTR selects the instruction (16 VGPRs → 32×16-bit packed).
-
-    V_CVT_SCALEF32_PK32_F32_FP6 (opcode 598):
-    - S0: 6 consecutive VGPRs — 32 packed FP6 E2M3 values (192 bits)
-    - S1: 1 VGPR — scale (f32, only exponent used)
-    - D0: 32 consecutive VGPRs — 32 FP32 results (1024 bits)
-
-    scale = 32'U(exponent(S1.f32));
-    for pass in 0:31:
-        tmp[pass*32+31:pass*32].f32 = fp6_to_f32_scale(S0[pass*6+5:pass*6].fp6, scale.u8)
-    D0[1023:0] = tmp.b1024
+    Each program handles GROUPS_PER_BLOCK consecutive groups.
     """
     pid_m = tl.program_id(0)
     pid_g = tl.program_id(1)
 
-    # Load 6 packed uint32s for this group (192 bits = 32 FP6 E2M3 values)
-    fp6_base = fp6_ptr + pid_m * stride_fp6_m + pid_g * 6
-    r0 = tl.load(fp6_base + 0).to(tl.uint32)
-    r1 = tl.load(fp6_base + 1).to(tl.uint32)
-    r2 = tl.load(fp6_base + 2).to(tl.uint32)
-    r3 = tl.load(fp6_base + 3).to(tl.uint32)
-    r4 = tl.load(fp6_base + 4).to(tl.uint32)
-    r5 = tl.load(fp6_base + 5).to(tl.uint32)
+    for g_off in range(GROUPS_PER_BLOCK):
+        g = pid_g * GROUPS_PER_BLOCK + g_off
 
-    # Load scale and convert to F32 format (scale_exp << 23)
-    scale_raw = tl.load(scale_ptr + pid_m * stride_scale_m + pid_g * stride_scale_g).to(tl.uint32)
-    scale_f32 = (scale_raw << 23)
+        # Load 6 packed uint32s for this group (192 bits = 32 FP6 E2M3 values)
+        fp6_base = fp6_ptr + pid_m * stride_fp6_m + g * 6
+        r0 = tl.load(fp6_base + 0).to(tl.uint32)
+        r1 = tl.load(fp6_base + 1).to(tl.uint32)
+        r2 = tl.load(fp6_base + 2).to(tl.uint32)
+        r3 = tl.load(fp6_base + 3).to(tl.uint32)
+        r4 = tl.load(fp6_base + 4).to(tl.uint32)
+        r5 = tl.load(fp6_base + 5).to(tl.uint32)
 
-    out_base = out_ptr + pid_m * stride_out_m + pid_g * GROUP_SIZE
+        # Load scale and convert to F32 format (scale_exp << 23)
+        scale_raw = tl.load(scale_ptr + pid_m * stride_scale_m + g * stride_scale_g).to(tl.uint32)
+        scale_f32 = (scale_raw << 23)
 
-    if OUT_DTYPE == tl.float32:
-        # f32 path: 32 VGPRs output (v56-v87), one f32 per element
-        (o0,  o1,  o2,  o3,  o4,  o5,  o6,  o7,
-         o8,  o9,  o10, o11, o12, o13, o14, o15,
-         o16, o17, o18, o19, o20, o21, o22, o23,
-         o24, o25, o26, o27, o28, o29, o30, o31) = tl.inline_asm_elementwise(
-            asm="""
-            v_mov_b32 v50, $32
-            v_mov_b32 v51, $33
-            v_mov_b32 v52, $34
-            v_mov_b32 v53, $35
-            v_mov_b32 v54, $36
-            v_mov_b32 v55, $37
-            v_cvt_scalef32_pk32_f32_fp6 v[56:87], v[50:55], $38
-            v_mov_b32 $0,  v56
-            v_mov_b32 $1,  v57
-            v_mov_b32 $2,  v58
-            v_mov_b32 $3,  v59
-            v_mov_b32 $4,  v60
-            v_mov_b32 $5,  v61
-            v_mov_b32 $6,  v62
-            v_mov_b32 $7,  v63
-            v_mov_b32 $8,  v64
-            v_mov_b32 $9,  v65
-            v_mov_b32 $10, v66
-            v_mov_b32 $11, v67
-            v_mov_b32 $12, v68
-            v_mov_b32 $13, v69
-            v_mov_b32 $14, v70
-            v_mov_b32 $15, v71
-            v_mov_b32 $16, v72
-            v_mov_b32 $17, v73
-            v_mov_b32 $18, v74
-            v_mov_b32 $19, v75
-            v_mov_b32 $20, v76
-            v_mov_b32 $21, v77
-            v_mov_b32 $22, v78
-            v_mov_b32 $23, v79
-            v_mov_b32 $24, v80
-            v_mov_b32 $25, v81
-            v_mov_b32 $26, v82
-            v_mov_b32 $27, v83
-            v_mov_b32 $28, v84
-            v_mov_b32 $29, v85
-            v_mov_b32 $30, v86
-            v_mov_b32 $31, v87
-            """,
-            constraints=(
-                "=v,=v,=v,=v,=v,=v,=v,=v,"
-                "=v,=v,=v,=v,=v,=v,=v,=v,"
-                "=v,=v,=v,=v,=v,=v,=v,=v,"
-                "=v,=v,=v,=v,=v,=v,=v,=v,"
-                "v,v,v,v,v,v,v,"
-                "~{v50},~{v51},~{v52},~{v53},~{v54},~{v55},"
-                "~{v56},~{v57},~{v58},~{v59},~{v60},~{v61},~{v62},~{v63},"
-                "~{v64},~{v65},~{v66},~{v67},~{v68},~{v69},~{v70},~{v71},"
-                "~{v72},~{v73},~{v74},~{v75},~{v76},~{v77},~{v78},~{v79},"
-                "~{v80},~{v81},~{v82},~{v83},~{v84},~{v85},~{v86},~{v87}"
-            ),
-            args=[r0, r1, r2, r3, r4, r5, scale_f32],
-            dtype=(tl.float32,) * 32,
-            is_pure=True,
-            pack=1,
-        )
-        tl.store(out_base + 0,  o0);  tl.store(out_base + 1,  o1)
-        tl.store(out_base + 2,  o2);  tl.store(out_base + 3,  o3)
-        tl.store(out_base + 4,  o4);  tl.store(out_base + 5,  o5)
-        tl.store(out_base + 6,  o6);  tl.store(out_base + 7,  o7)
-        tl.store(out_base + 8,  o8);  tl.store(out_base + 9,  o9)
-        tl.store(out_base + 10, o10); tl.store(out_base + 11, o11)
-        tl.store(out_base + 12, o12); tl.store(out_base + 13, o13)
-        tl.store(out_base + 14, o14); tl.store(out_base + 15, o15)
-        tl.store(out_base + 16, o16); tl.store(out_base + 17, o17)
-        tl.store(out_base + 18, o18); tl.store(out_base + 19, o19)
-        tl.store(out_base + 20, o20); tl.store(out_base + 21, o21)
-        tl.store(out_base + 22, o22); tl.store(out_base + 23, o23)
-        tl.store(out_base + 24, o24); tl.store(out_base + 25, o25)
-        tl.store(out_base + 26, o26); tl.store(out_base + 27, o27)
-        tl.store(out_base + 28, o28); tl.store(out_base + 29, o29)
-        tl.store(out_base + 30, o30); tl.store(out_base + 31, o31)
-    else:
-        # f16/bf16: ASM_INSTR selects the instruction; 16 VGPRs (v56-v71),
-        # each holding 2 packed 16-bit values.
-        (p0,  p1,  p2,  p3,  p4,  p5,  p6,  p7,
-         p8,  p9,  p10, p11, p12, p13, p14, p15) = tl.inline_asm_elementwise(
-            asm=f"""
-            v_mov_b32 v50, $16
-            v_mov_b32 v51, $17
-            v_mov_b32 v52, $18
-            v_mov_b32 v53, $19
-            v_mov_b32 v54, $20
-            v_mov_b32 v55, $21
-            {ASM_INSTR} v[56:71], v[50:55], $22
-            v_mov_b32 $0,  v56
-            v_mov_b32 $1,  v57
-            v_mov_b32 $2,  v58
-            v_mov_b32 $3,  v59
-            v_mov_b32 $4,  v60
-            v_mov_b32 $5,  v61
-            v_mov_b32 $6,  v62
-            v_mov_b32 $7,  v63
-            v_mov_b32 $8,  v64
-            v_mov_b32 $9,  v65
-            v_mov_b32 $10, v66
-            v_mov_b32 $11, v67
-            v_mov_b32 $12, v68
-            v_mov_b32 $13, v69
-            v_mov_b32 $14, v70
-            v_mov_b32 $15, v71
-            """,
-            constraints=(
-                "=v,=v,=v,=v,=v,=v,=v,=v,"
-                "=v,=v,=v,=v,=v,=v,=v,=v,"
-                "v,v,v,v,v,v,v,"
-                "~{v50},~{v51},~{v52},~{v53},~{v54},~{v55},"
-                "~{v56},~{v57},~{v58},~{v59},~{v60},~{v61},~{v62},~{v63},"
-                "~{v64},~{v65},~{v66},~{v67},~{v68},~{v69},~{v70},~{v71}"
-            ),
-            args=[r0, r1, r2, r3, r4, r5, scale_f32],
-            dtype=(tl.uint32,) * 16,
-            is_pure=True,
-            pack=1,
-        )
-        tl.store(out_base +  0, (p0  & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base +  1, ((p0  >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base +  2, (p1  & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base +  3, ((p1  >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base +  4, (p2  & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base +  5, ((p2  >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base +  6, (p3  & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base +  7, ((p3  >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base +  8, (p4  & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base +  9, ((p4  >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 10, (p5  & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 11, ((p5  >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 12, (p6  & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 13, ((p6  >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 14, (p7  & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 15, ((p7  >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 16, (p8  & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 17, ((p8  >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 18, (p9  & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 19, ((p9  >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 20, (p10 & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 21, ((p10 >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 22, (p11 & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 23, ((p11 >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 24, (p12 & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 25, ((p12 >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 26, (p13 & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 27, ((p13 >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 28, (p14 & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 29, ((p14 >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 30, (p15 & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 31, ((p15 >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
+        if OUT_DTYPE == tl.float32:
+            out_base = out_ptr + pid_m * stride_out_m + g * GROUP_SIZE
+            (o0,  o1,  o2,  o3,  o4,  o5,  o6,  o7,
+             o8,  o9,  o10, o11, o12, o13, o14, o15,
+             o16, o17, o18, o19, o20, o21, o22, o23,
+             o24, o25, o26, o27, o28, o29, o30, o31) = tl.inline_asm_elementwise(
+                asm="""
+                v_mov_b32 v50, $32
+                v_mov_b32 v51, $33
+                v_mov_b32 v52, $34
+                v_mov_b32 v53, $35
+                v_mov_b32 v54, $36
+                v_mov_b32 v55, $37
+                v_cvt_scalef32_pk32_f32_fp6 v[56:87], v[50:55], $38
+                v_mov_b32 $0,  v56
+                v_mov_b32 $1,  v57
+                v_mov_b32 $2,  v58
+                v_mov_b32 $3,  v59
+                v_mov_b32 $4,  v60
+                v_mov_b32 $5,  v61
+                v_mov_b32 $6,  v62
+                v_mov_b32 $7,  v63
+                v_mov_b32 $8,  v64
+                v_mov_b32 $9,  v65
+                v_mov_b32 $10, v66
+                v_mov_b32 $11, v67
+                v_mov_b32 $12, v68
+                v_mov_b32 $13, v69
+                v_mov_b32 $14, v70
+                v_mov_b32 $15, v71
+                v_mov_b32 $16, v72
+                v_mov_b32 $17, v73
+                v_mov_b32 $18, v74
+                v_mov_b32 $19, v75
+                v_mov_b32 $20, v76
+                v_mov_b32 $21, v77
+                v_mov_b32 $22, v78
+                v_mov_b32 $23, v79
+                v_mov_b32 $24, v80
+                v_mov_b32 $25, v81
+                v_mov_b32 $26, v82
+                v_mov_b32 $27, v83
+                v_mov_b32 $28, v84
+                v_mov_b32 $29, v85
+                v_mov_b32 $30, v86
+                v_mov_b32 $31, v87
+                """,
+                constraints=(
+                    "=v,=v,=v,=v,=v,=v,=v,=v,"
+                    "=v,=v,=v,=v,=v,=v,=v,=v,"
+                    "=v,=v,=v,=v,=v,=v,=v,=v,"
+                    "=v,=v,=v,=v,=v,=v,=v,=v,"
+                    "v,v,v,v,v,v,v,"
+                    "~{v50},~{v51},~{v52},~{v53},~{v54},~{v55},"
+                    "~{v56},~{v57},~{v58},~{v59},~{v60},~{v61},~{v62},~{v63},"
+                    "~{v64},~{v65},~{v66},~{v67},~{v68},~{v69},~{v70},~{v71},"
+                    "~{v72},~{v73},~{v74},~{v75},~{v76},~{v77},~{v78},~{v79},"
+                    "~{v80},~{v81},~{v82},~{v83},~{v84},~{v85},~{v86},~{v87}"
+                ),
+                args=[r0, r1, r2, r3, r4, r5, scale_f32],
+                dtype=(tl.float32,) * 32,
+                is_pure=True,
+                pack=1,
+            )
+            tl.store(out_base + 0,  o0);  tl.store(out_base + 1,  o1)
+            tl.store(out_base + 2,  o2);  tl.store(out_base + 3,  o3)
+            tl.store(out_base + 4,  o4);  tl.store(out_base + 5,  o5)
+            tl.store(out_base + 6,  o6);  tl.store(out_base + 7,  o7)
+            tl.store(out_base + 8,  o8);  tl.store(out_base + 9,  o9)
+            tl.store(out_base + 10, o10); tl.store(out_base + 11, o11)
+            tl.store(out_base + 12, o12); tl.store(out_base + 13, o13)
+            tl.store(out_base + 14, o14); tl.store(out_base + 15, o15)
+            tl.store(out_base + 16, o16); tl.store(out_base + 17, o17)
+            tl.store(out_base + 18, o18); tl.store(out_base + 19, o19)
+            tl.store(out_base + 20, o20); tl.store(out_base + 21, o21)
+            tl.store(out_base + 22, o22); tl.store(out_base + 23, o23)
+            tl.store(out_base + 24, o24); tl.store(out_base + 25, o25)
+            tl.store(out_base + 26, o26); tl.store(out_base + 27, o27)
+            tl.store(out_base + 28, o28); tl.store(out_base + 29, o29)
+            tl.store(out_base + 30, o30); tl.store(out_base + 31, o31)
+        else:
+            # Packed path: output tensor is uint32 with K//2 cols; each p_i holds
+            # 2 packed 16-bit values already in the right bit layout — store directly.
+            out_base = out_ptr + pid_m * stride_out_m + g * (GROUP_SIZE // 2)
+            (p0,  p1,  p2,  p3,  p4,  p5,  p6,  p7,
+             p8,  p9,  p10, p11, p12, p13, p14, p15) = tl.inline_asm_elementwise(
+                asm=f"""
+                v_mov_b32 v50, $16
+                v_mov_b32 v51, $17
+                v_mov_b32 v52, $18
+                v_mov_b32 v53, $19
+                v_mov_b32 v54, $20
+                v_mov_b32 v55, $21
+                {ASM_INSTR} v[56:71], v[50:55], $22
+                v_mov_b32 $0,  v56
+                v_mov_b32 $1,  v57
+                v_mov_b32 $2,  v58
+                v_mov_b32 $3,  v59
+                v_mov_b32 $4,  v60
+                v_mov_b32 $5,  v61
+                v_mov_b32 $6,  v62
+                v_mov_b32 $7,  v63
+                v_mov_b32 $8,  v64
+                v_mov_b32 $9,  v65
+                v_mov_b32 $10, v66
+                v_mov_b32 $11, v67
+                v_mov_b32 $12, v68
+                v_mov_b32 $13, v69
+                v_mov_b32 $14, v70
+                v_mov_b32 $15, v71
+                """,
+                constraints=(
+                    "=v,=v,=v,=v,=v,=v,=v,=v,"
+                    "=v,=v,=v,=v,=v,=v,=v,=v,"
+                    "v,v,v,v,v,v,v,"
+                    "~{v50},~{v51},~{v52},~{v53},~{v54},~{v55},"
+                    "~{v56},~{v57},~{v58},~{v59},~{v60},~{v61},~{v62},~{v63},"
+                    "~{v64},~{v65},~{v66},~{v67},~{v68},~{v69},~{v70},~{v71}"
+                ),
+                args=[r0, r1, r2, r3, r4, r5, scale_f32],
+                dtype=(tl.uint32,) * 16,
+                is_pure=True,
+                pack=1,
+            )
+            tl.store(out_base +  0, p0)
+            tl.store(out_base +  1, p1)
+            tl.store(out_base +  2, p2)
+            tl.store(out_base +  3, p3)
+            tl.store(out_base +  4, p4)
+            tl.store(out_base +  5, p5)
+            tl.store(out_base +  6, p6)
+            tl.store(out_base +  7, p7)
+            tl.store(out_base +  8, p8)
+            tl.store(out_base +  9, p9)
+            tl.store(out_base + 10, p10)
+            tl.store(out_base + 11, p11)
+            tl.store(out_base + 12, p12)
+            tl.store(out_base + 13, p13)
+            tl.store(out_base + 14, p14)
+            tl.store(out_base + 15, p15)
 
 
 @triton.jit
@@ -857,6 +835,7 @@ def mxfp6e3_to_f32_kernel_hw(
     stride_scale_g,  # Group stride for scales
     stride_out_m,    # Row stride for output
     GROUP_SIZE: tl.constexpr,  # Must be 32
+    GROUPS_PER_BLOCK: tl.constexpr = 1,
     OUT_DTYPE: tl.constexpr = tl.float32,
     ASM_INSTR: tl.constexpr = "v_cvt_scalef32_pk32_f16_bf6",
 ):
@@ -864,189 +843,163 @@ def mxfp6e3_to_f32_kernel_hw(
     Hardware-accelerated MXFP6 E3M2 upcast kernel.
     f32 path: hard-coded v_cvt_scalef32_pk32_f32_bf6 (32 VGPRs → 32×f32).
     f16/bf16 path: ASM_INSTR selects the instruction (16 VGPRs → 32×16-bit packed).
-
-    V_CVT_SCALEF32_PK32_F32_BF6 (opcode 599):
-    - S0: 6 consecutive VGPRs — 32 packed FP6 E3M2 values (192 bits)
-    - S1: 1 VGPR — scale (f32, only exponent used)
-    - D0: 32 consecutive VGPRs — 32 FP32 results (1024 bits)
-
-    scale = 32'U(exponent(S1.f32));
-    for pass in 0:31:
-        tmp[pass*32+31:pass*32].f32 = bf6_to_f32_scale(S0[pass*6+5:pass*6].bf6, scale.u8)
-    D0[1023:0] = tmp.b1024
+    Each program handles GROUPS_PER_BLOCK consecutive groups.
     """
     pid_m = tl.program_id(0)
     pid_g = tl.program_id(1)
 
-    # Load 6 packed uint32s for this group (192 bits = 32 FP6 E3M2 values)
-    fp6_base = fp6_ptr + pid_m * stride_fp6_m + pid_g * 6
-    r0 = tl.load(fp6_base + 0).to(tl.uint32)
-    r1 = tl.load(fp6_base + 1).to(tl.uint32)
-    r2 = tl.load(fp6_base + 2).to(tl.uint32)
-    r3 = tl.load(fp6_base + 3).to(tl.uint32)
-    r4 = tl.load(fp6_base + 4).to(tl.uint32)
-    r5 = tl.load(fp6_base + 5).to(tl.uint32)
+    for g_off in range(GROUPS_PER_BLOCK):
+        g = pid_g * GROUPS_PER_BLOCK + g_off
 
-    # Load scale and convert to F32 format (scale_exp << 23)
-    scale_raw = tl.load(scale_ptr + pid_m * stride_scale_m + pid_g * stride_scale_g).to(tl.uint32)
-    scale_f32 = (scale_raw << 23)
+        fp6_base = fp6_ptr + pid_m * stride_fp6_m + g * 6
+        r0 = tl.load(fp6_base + 0).to(tl.uint32)
+        r1 = tl.load(fp6_base + 1).to(tl.uint32)
+        r2 = tl.load(fp6_base + 2).to(tl.uint32)
+        r3 = tl.load(fp6_base + 3).to(tl.uint32)
+        r4 = tl.load(fp6_base + 4).to(tl.uint32)
+        r5 = tl.load(fp6_base + 5).to(tl.uint32)
 
-    out_base = out_ptr + pid_m * stride_out_m + pid_g * GROUP_SIZE
+        scale_raw = tl.load(scale_ptr + pid_m * stride_scale_m + g * stride_scale_g).to(tl.uint32)
+        scale_f32 = (scale_raw << 23)
 
-    if OUT_DTYPE == tl.float32:
-        (o0,  o1,  o2,  o3,  o4,  o5,  o6,  o7,
-         o8,  o9,  o10, o11, o12, o13, o14, o15,
-         o16, o17, o18, o19, o20, o21, o22, o23,
-         o24, o25, o26, o27, o28, o29, o30, o31) = tl.inline_asm_elementwise(
-            asm="""
-            v_mov_b32 v50, $32
-            v_mov_b32 v51, $33
-            v_mov_b32 v52, $34
-            v_mov_b32 v53, $35
-            v_mov_b32 v54, $36
-            v_mov_b32 v55, $37
-            v_cvt_scalef32_pk32_f32_bf6 v[56:87], v[50:55], $38
-            v_mov_b32 $0,  v56
-            v_mov_b32 $1,  v57
-            v_mov_b32 $2,  v58
-            v_mov_b32 $3,  v59
-            v_mov_b32 $4,  v60
-            v_mov_b32 $5,  v61
-            v_mov_b32 $6,  v62
-            v_mov_b32 $7,  v63
-            v_mov_b32 $8,  v64
-            v_mov_b32 $9,  v65
-            v_mov_b32 $10, v66
-            v_mov_b32 $11, v67
-            v_mov_b32 $12, v68
-            v_mov_b32 $13, v69
-            v_mov_b32 $14, v70
-            v_mov_b32 $15, v71
-            v_mov_b32 $16, v72
-            v_mov_b32 $17, v73
-            v_mov_b32 $18, v74
-            v_mov_b32 $19, v75
-            v_mov_b32 $20, v76
-            v_mov_b32 $21, v77
-            v_mov_b32 $22, v78
-            v_mov_b32 $23, v79
-            v_mov_b32 $24, v80
-            v_mov_b32 $25, v81
-            v_mov_b32 $26, v82
-            v_mov_b32 $27, v83
-            v_mov_b32 $28, v84
-            v_mov_b32 $29, v85
-            v_mov_b32 $30, v86
-            v_mov_b32 $31, v87
-            """,
-            constraints=(
-                "=v,=v,=v,=v,=v,=v,=v,=v,"
-                "=v,=v,=v,=v,=v,=v,=v,=v,"
-                "=v,=v,=v,=v,=v,=v,=v,=v,"
-                "=v,=v,=v,=v,=v,=v,=v,=v,"
-                "v,v,v,v,v,v,v,"
-                "~{v50},~{v51},~{v52},~{v53},~{v54},~{v55},"
-                "~{v56},~{v57},~{v58},~{v59},~{v60},~{v61},~{v62},~{v63},"
-                "~{v64},~{v65},~{v66},~{v67},~{v68},~{v69},~{v70},~{v71},"
-                "~{v72},~{v73},~{v74},~{v75},~{v76},~{v77},~{v78},~{v79},"
-                "~{v80},~{v81},~{v82},~{v83},~{v84},~{v85},~{v86},~{v87}"
-            ),
-            args=[r0, r1, r2, r3, r4, r5, scale_f32],
-            dtype=(tl.float32,) * 32,
-            is_pure=True,
-            pack=1,
-        )
-        tl.store(out_base + 0,  o0);  tl.store(out_base + 1,  o1)
-        tl.store(out_base + 2,  o2);  tl.store(out_base + 3,  o3)
-        tl.store(out_base + 4,  o4);  tl.store(out_base + 5,  o5)
-        tl.store(out_base + 6,  o6);  tl.store(out_base + 7,  o7)
-        tl.store(out_base + 8,  o8);  tl.store(out_base + 9,  o9)
-        tl.store(out_base + 10, o10); tl.store(out_base + 11, o11)
-        tl.store(out_base + 12, o12); tl.store(out_base + 13, o13)
-        tl.store(out_base + 14, o14); tl.store(out_base + 15, o15)
-        tl.store(out_base + 16, o16); tl.store(out_base + 17, o17)
-        tl.store(out_base + 18, o18); tl.store(out_base + 19, o19)
-        tl.store(out_base + 20, o20); tl.store(out_base + 21, o21)
-        tl.store(out_base + 22, o22); tl.store(out_base + 23, o23)
-        tl.store(out_base + 24, o24); tl.store(out_base + 25, o25)
-        tl.store(out_base + 26, o26); tl.store(out_base + 27, o27)
-        tl.store(out_base + 28, o28); tl.store(out_base + 29, o29)
-        tl.store(out_base + 30, o30); tl.store(out_base + 31, o31)
-    else:
-        # f16/bf16: ASM_INSTR selects the instruction; 16 VGPRs (v56-v71),
-        # each holding 2 packed 16-bit values.
-        (p0,  p1,  p2,  p3,  p4,  p5,  p6,  p7,
-         p8,  p9,  p10, p11, p12, p13, p14, p15) = tl.inline_asm_elementwise(
-            asm=f"""
-            v_mov_b32 v50, $16
-            v_mov_b32 v51, $17
-            v_mov_b32 v52, $18
-            v_mov_b32 v53, $19
-            v_mov_b32 v54, $20
-            v_mov_b32 v55, $21
-            {ASM_INSTR} v[56:71], v[50:55], $22
-            v_mov_b32 $0,  v56
-            v_mov_b32 $1,  v57
-            v_mov_b32 $2,  v58
-            v_mov_b32 $3,  v59
-            v_mov_b32 $4,  v60
-            v_mov_b32 $5,  v61
-            v_mov_b32 $6,  v62
-            v_mov_b32 $7,  v63
-            v_mov_b32 $8,  v64
-            v_mov_b32 $9,  v65
-            v_mov_b32 $10, v66
-            v_mov_b32 $11, v67
-            v_mov_b32 $12, v68
-            v_mov_b32 $13, v69
-            v_mov_b32 $14, v70
-            v_mov_b32 $15, v71
-            """,
-            constraints=(
-                "=v,=v,=v,=v,=v,=v,=v,=v,"
-                "=v,=v,=v,=v,=v,=v,=v,=v,"
-                "v,v,v,v,v,v,v,"
-                "~{v50},~{v51},~{v52},~{v53},~{v54},~{v55},"
-                "~{v56},~{v57},~{v58},~{v59},~{v60},~{v61},~{v62},~{v63},"
-                "~{v64},~{v65},~{v66},~{v67},~{v68},~{v69},~{v70},~{v71}"
-            ),
-            args=[r0, r1, r2, r3, r4, r5, scale_f32],
-            dtype=(tl.uint32,) * 16,
-            is_pure=True,
-            pack=1,
-        )
-        tl.store(out_base +  0, (p0  & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base +  1, ((p0  >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base +  2, (p1  & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base +  3, ((p1  >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base +  4, (p2  & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base +  5, ((p2  >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base +  6, (p3  & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base +  7, ((p3  >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base +  8, (p4  & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base +  9, ((p4  >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 10, (p5  & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 11, ((p5  >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 12, (p6  & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 13, ((p6  >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 14, (p7  & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 15, ((p7  >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 16, (p8  & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 17, ((p8  >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 18, (p9  & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 19, ((p9  >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 20, (p10 & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 21, ((p10 >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 22, (p11 & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 23, ((p11 >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 24, (p12 & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 25, ((p12 >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 26, (p13 & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 27, ((p13 >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 28, (p14 & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 29, ((p14 >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 30, (p15 & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
-        tl.store(out_base + 31, ((p15 >> 16) & 0xFFFF).to(tl.uint16).to(OUT_DTYPE, bitcast=True))
+        if OUT_DTYPE == tl.float32:
+            out_base = out_ptr + pid_m * stride_out_m + g * GROUP_SIZE
+            (o0,  o1,  o2,  o3,  o4,  o5,  o6,  o7,
+             o8,  o9,  o10, o11, o12, o13, o14, o15,
+             o16, o17, o18, o19, o20, o21, o22, o23,
+             o24, o25, o26, o27, o28, o29, o30, o31) = tl.inline_asm_elementwise(
+                asm="""
+                v_mov_b32 v50, $32
+                v_mov_b32 v51, $33
+                v_mov_b32 v52, $34
+                v_mov_b32 v53, $35
+                v_mov_b32 v54, $36
+                v_mov_b32 v55, $37
+                v_cvt_scalef32_pk32_f32_bf6 v[56:87], v[50:55], $38
+                v_mov_b32 $0,  v56
+                v_mov_b32 $1,  v57
+                v_mov_b32 $2,  v58
+                v_mov_b32 $3,  v59
+                v_mov_b32 $4,  v60
+                v_mov_b32 $5,  v61
+                v_mov_b32 $6,  v62
+                v_mov_b32 $7,  v63
+                v_mov_b32 $8,  v64
+                v_mov_b32 $9,  v65
+                v_mov_b32 $10, v66
+                v_mov_b32 $11, v67
+                v_mov_b32 $12, v68
+                v_mov_b32 $13, v69
+                v_mov_b32 $14, v70
+                v_mov_b32 $15, v71
+                v_mov_b32 $16, v72
+                v_mov_b32 $17, v73
+                v_mov_b32 $18, v74
+                v_mov_b32 $19, v75
+                v_mov_b32 $20, v76
+                v_mov_b32 $21, v77
+                v_mov_b32 $22, v78
+                v_mov_b32 $23, v79
+                v_mov_b32 $24, v80
+                v_mov_b32 $25, v81
+                v_mov_b32 $26, v82
+                v_mov_b32 $27, v83
+                v_mov_b32 $28, v84
+                v_mov_b32 $29, v85
+                v_mov_b32 $30, v86
+                v_mov_b32 $31, v87
+                """,
+                constraints=(
+                    "=v,=v,=v,=v,=v,=v,=v,=v,"
+                    "=v,=v,=v,=v,=v,=v,=v,=v,"
+                    "=v,=v,=v,=v,=v,=v,=v,=v,"
+                    "=v,=v,=v,=v,=v,=v,=v,=v,"
+                    "v,v,v,v,v,v,v,"
+                    "~{v50},~{v51},~{v52},~{v53},~{v54},~{v55},"
+                    "~{v56},~{v57},~{v58},~{v59},~{v60},~{v61},~{v62},~{v63},"
+                    "~{v64},~{v65},~{v66},~{v67},~{v68},~{v69},~{v70},~{v71},"
+                    "~{v72},~{v73},~{v74},~{v75},~{v76},~{v77},~{v78},~{v79},"
+                    "~{v80},~{v81},~{v82},~{v83},~{v84},~{v85},~{v86},~{v87}"
+                ),
+                args=[r0, r1, r2, r3, r4, r5, scale_f32],
+                dtype=(tl.float32,) * 32,
+                is_pure=True,
+                pack=1,
+            )
+            tl.store(out_base + 0,  o0);  tl.store(out_base + 1,  o1)
+            tl.store(out_base + 2,  o2);  tl.store(out_base + 3,  o3)
+            tl.store(out_base + 4,  o4);  tl.store(out_base + 5,  o5)
+            tl.store(out_base + 6,  o6);  tl.store(out_base + 7,  o7)
+            tl.store(out_base + 8,  o8);  tl.store(out_base + 9,  o9)
+            tl.store(out_base + 10, o10); tl.store(out_base + 11, o11)
+            tl.store(out_base + 12, o12); tl.store(out_base + 13, o13)
+            tl.store(out_base + 14, o14); tl.store(out_base + 15, o15)
+            tl.store(out_base + 16, o16); tl.store(out_base + 17, o17)
+            tl.store(out_base + 18, o18); tl.store(out_base + 19, o19)
+            tl.store(out_base + 20, o20); tl.store(out_base + 21, o21)
+            tl.store(out_base + 22, o22); tl.store(out_base + 23, o23)
+            tl.store(out_base + 24, o24); tl.store(out_base + 25, o25)
+            tl.store(out_base + 26, o26); tl.store(out_base + 27, o27)
+            tl.store(out_base + 28, o28); tl.store(out_base + 29, o29)
+            tl.store(out_base + 30, o30); tl.store(out_base + 31, o31)
+        else:
+            out_base = out_ptr + pid_m * stride_out_m + g * (GROUP_SIZE // 2)
+            (p0,  p1,  p2,  p3,  p4,  p5,  p6,  p7,
+             p8,  p9,  p10, p11, p12, p13, p14, p15) = tl.inline_asm_elementwise(
+                asm=f"""
+                v_mov_b32 v50, $16
+                v_mov_b32 v51, $17
+                v_mov_b32 v52, $18
+                v_mov_b32 v53, $19
+                v_mov_b32 v54, $20
+                v_mov_b32 v55, $21
+                {ASM_INSTR} v[56:71], v[50:55], $22
+                v_mov_b32 $0,  v56
+                v_mov_b32 $1,  v57
+                v_mov_b32 $2,  v58
+                v_mov_b32 $3,  v59
+                v_mov_b32 $4,  v60
+                v_mov_b32 $5,  v61
+                v_mov_b32 $6,  v62
+                v_mov_b32 $7,  v63
+                v_mov_b32 $8,  v64
+                v_mov_b32 $9,  v65
+                v_mov_b32 $10, v66
+                v_mov_b32 $11, v67
+                v_mov_b32 $12, v68
+                v_mov_b32 $13, v69
+                v_mov_b32 $14, v70
+                v_mov_b32 $15, v71
+                """,
+                constraints=(
+                    "=v,=v,=v,=v,=v,=v,=v,=v,"
+                    "=v,=v,=v,=v,=v,=v,=v,=v,"
+                    "v,v,v,v,v,v,v,"
+                    "~{v50},~{v51},~{v52},~{v53},~{v54},~{v55},"
+                    "~{v56},~{v57},~{v58},~{v59},~{v60},~{v61},~{v62},~{v63},"
+                    "~{v64},~{v65},~{v66},~{v67},~{v68},~{v69},~{v70},~{v71}"
+                ),
+                args=[r0, r1, r2, r3, r4, r5, scale_f32],
+                dtype=(tl.uint32,) * 16,
+                is_pure=True,
+                pack=1,
+            )
+            tl.store(out_base +  0, p0)
+            tl.store(out_base +  1, p1)
+            tl.store(out_base +  2, p2)
+            tl.store(out_base +  3, p3)
+            tl.store(out_base +  4, p4)
+            tl.store(out_base +  5, p5)
+            tl.store(out_base +  6, p6)
+            tl.store(out_base +  7, p7)
+            tl.store(out_base +  8, p8)
+            tl.store(out_base +  9, p9)
+            tl.store(out_base + 10, p10)
+            tl.store(out_base + 11, p11)
+            tl.store(out_base + 12, p12)
+            tl.store(out_base + 13, p13)
+            tl.store(out_base + 14, p14)
+            tl.store(out_base + 15, p15)
 
 
 def mxfp6_to_f32_triton_hw(
@@ -1068,8 +1021,8 @@ def mxfp6_to_f32_triton_hw(
     assert fp6_data.shape == (M, n_groups * 6), \
         f"Expected fp6_data shape ({M}, {n_groups * 6}), got {fp6_data.shape}"
 
-    out = torch.empty((M, K), dtype=out_dtype, device=fp6_data.device)
-    grid = (M, n_groups)
+    GROUPS_PER_BLOCK = 1
+    grid = (M, n_groups // GROUPS_PER_BLOCK)
 
     if fmt == "e2m3":
         kernel = mxfp6e2_to_f32_kernel_hw
@@ -1077,22 +1030,30 @@ def mxfp6_to_f32_triton_hw(
     else:
         kernel = mxfp6e3_to_f32_kernel_hw
         asm_map = _FP6E3_ASM
-    # f32 path uses a hard-coded instruction in the kernel; pick a valid entry as a dummy
     asm_instr = asm_map.get(out_dtype, next(iter(asm_map.values())))
 
+    if out_dtype == torch.float32:
+        kernel_out = torch.empty((M, K), dtype=torch.float32, device=fp6_data.device)
+    else:
+        # f16/bf16 path: kernel stores packed uint32s; view as out_dtype afterward
+        kernel_out = torch.empty((M, K // 2), dtype=torch.uint32, device=fp6_data.device)
+
     kernel[grid](
-        fp6_data, scales, out,
+        fp6_data, scales, kernel_out,
         M, K,
         fp6_data.stride(0),
         scales.stride(0), scales.stride(1),
-        out.stride(0),
+        kernel_out.stride(0),
         GROUP_SIZE=group_size,
+        GROUPS_PER_BLOCK=GROUPS_PER_BLOCK,
         OUT_DTYPE=_TORCH_TO_TL_DTYPE[out_dtype],
         ASM_INSTR=asm_instr,
-        num_warps=num_warps,
+        num_warps=1,
     )
 
-    return out
+    if out_dtype == torch.float32:
+        return kernel_out
+    return kernel_out.view(out_dtype)
 
 
 def _apply_scales(A_ref_f32, scales, M, K, GROUP_SIZE):
@@ -1111,7 +1072,7 @@ def _print_errors(A_f32_hw, A_ref_scaled, A, fmt_label):
 
     quant_max  = torch.max(torch.abs(A_f32_hw - A)).item()
     quant_mean = torch.mean(torch.abs(A_f32_hw - A)).item()
-    print(f"   Quantization error ({fmt_label} roundtrip vs original FP32):")
+    print(f"   Quantization error ({fmt_label} roundtrip vs original):")
     print(f"      Max error:  {quant_max:.6f}")
     print(f"      Mean error: {quant_mean:.6f}")
 
