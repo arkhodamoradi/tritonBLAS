@@ -24,15 +24,18 @@ from loraq.linear import (
     TritonLinearLoRaQ_8_8, TritonLinearLoRaQ_8_16,
     TritonLinearLoRaQ_16_8, TritonLinearLoRaQ_16_16,
 )
-from loraq.quant import dynamic_mxfp8_quant, dynamic_mxfp4_quant
+from loraq.quant import dynamic_mxfp8_quant, dynamic_mxfp4_quant, mxfp4_to_f32, e8m0_to_f32
 from loraq.autotune_configs import (
     AutotunedLoRaQ, AutotunedLoRaQ_8_16, AutotunedLoRaQ_16_8, AutotunedLoRaQ_16_16,
+    AutotunedLoRaQ4, AutotunedLoRaQ4_16,
     AutotunedLoRaQ3, AutotunedLoRaQFP16LR, AutotunedDualGEMM, AutotunedProjectAndQuant, LORAQ_Q8_CONFIGS,
 )
 from loraq.updated_kernels import (
     loraq_fused_q8_kernel,
     loraq_fused_q8_scaled_kernel_8_8,
     loraq_fused_q8_scaled_kernel_8_8_RL,
+    loraq_fused_q4_kernel,
+    loraq_fused_q4_kernel_4_16,
     loraq_fused_q8_scaled_kernel_8_16,
     loraq_fused_q8_scaled_kernel_16_8,
     loraq_fused_q8_scaled_kernel_16_16,
@@ -79,11 +82,11 @@ SIZES = [
     (4096, 4608, 1152), # pixart ffn down
     (4096, 1152, 4608), # pixart ffn up
     (512, 3072, 3072), # flux
-    (512,3072,12288), 
+    (512,3072,12288),
     (4096,3072,3072),
     (4096,12288,3072),
     (4096,3072,12288),
-    #(4096,  4096,  4096),    # large batch
+    (4096,  4096,  4096),    # large batch
 ]
 
 WARMUP = 25
@@ -956,6 +959,168 @@ def bench_loraq3(sizes):
 
 
 # ---------------------------------------------------------------------------
+# K7 (FP8) vs K13 (FP4) vs SVDQ comparison
+# ---------------------------------------------------------------------------
+
+def bench_v1_vs_q4_vs_svdq(sizes):
+    """
+    Three-way comparison:
+      K7   (loraq_fused_q8_kernel)  — MXFP8 activation, FP8 R/L, FP4 W
+      K13  (loraq_fused_q4_kernel)  — MXFP8 activation, FP8 R, FP4 L/W, FP8 out
+      K14  (loraq_fused_q4_kernel_4_16) — MXFP8 activation, FP8 R, FP4 L/W, FP16 out
+      SVDQ (kernels 5+6)            — FP16 activation, rank=32 FP16 L/R
+
+    K7 uses rank=64 FP8 L/R. K13/K14 use rank=128 with FP4 R/L.
+    Online activation quantisation is excluded from K7/K13/K14 timing by design.
+    """
+    rows = []
+    W = 175
+    print("\n" + "=" * W)
+    print("  K7 (FP8 in/out) vs K13 (FP8 A, FP4 R/L/W, FP8 out) vs K14 (FP8 A, FP4 R/L/W, FP16 out) vs SVDQ — all fully autotuned")
+    print("  K7:   MXFP8 activation, FP8 R/L (rank=64),  FP4 W")
+    print("  K13:  MXFP8 activation, FP4 R/L (rank=128), FP4 W, FP8 out")
+    print("  K14:  MXFP8 activation, FP4 R/L (rank=128), FP4 W, FP16 out")
+    print("  SVDQ: FP16 activation,  FP16 R/L (rank=32),  FP4 W — kernels 5+6")
+    print("=" * W)
+    header = (
+        f"{'M':>6} {'K':>6} {'N':>6}  "
+        f"{'SVDQ µs':>10} {'SVDQ TF':>8}  "
+        f"{'K7 µs':>9} {'K7 TF':>7}  "
+        f"{'K13 µs':>9} {'K13 TF':>7}  "
+        f"{'K14 µs':>9} {'K14 TF':>7}  "
+        f"{'K7/SVD':>7} {'K13/SVD':>8} {'K14/SVD':>8} {'K13/K7':>7} {'K14/K7':>7}"
+    )
+    print(header)
+    print("-" * W)
+
+    at_k7   = AutotunedLoRaQ(loraq_fused_q8_kernel,       LORAQ_Q8_CONFIGS, warmup=5, rep=25)
+    at_k13  = AutotunedLoRaQ4(loraq_fused_q4_kernel,      LORAQ_Q8_CONFIGS, warmup=5, rep=25)
+    at_k14  = AutotunedLoRaQ4_16(loraq_fused_q4_kernel_4_16, LORAQ_Q8_CONFIGS, warmup=5, rep=25)
+    at_pq   = AutotunedProjectAndQuant(loraq_project_and_quant_kernel, warmup=5, rep=25)
+    at_dg   = AutotunedDualGEMM(loraq_dual_gemm_kernel, LORAQ_Q8_CONFIGS, warmup=5, rep=25)
+
+    for M, K, N in sizes:
+        if K % 64 != 0 or N % 32 != 0:
+            continue
+
+        x = torch.randn(M, K, device="cuda", dtype=torch.float16)
+
+        # Activations: FP8 for K7/K13/K14 (all pre-quantised, cost excluded)
+        a_fp8, a_scale_fp8 = dynamic_mxfp8_quant(x)
+
+        ref_linear  = nn.Linear(K, N, bias=False, device="cuda", dtype=torch.float16)
+        loraq_layer = TritonLinearLoRA.from_float(ref_linear)   # SVDQ rank=32 FP16 L/R
+        v1_layer    = TritonLinearLoRaQ.from_float(ref_linear)  # K7/K13 rank=64 FP8 L/R
+
+        # Compute rank-128 FP4 R and L for K13/K14 via direct SVD of the FP4 weight residual.
+        # rank must match at_k13.rank (128) — cannot reuse K7's rank-64 FP8 tensors.
+        rank_q4  = at_k13.rank   # 128
+        w_deq    = mxfp4_to_f32(v1_layer.weight_fp4)                            # (N, K) normalised fp32
+        s_exp    = e8m0_to_f32(v1_layer.weight_scale).repeat_interleave(32, dim=-1)  # (N, K) fp32
+        residual = (ref_linear.weight.to(torch.float16).cuda().float() - w_deq * s_exp)
+        U, S, Vh = torch.linalg.svd(residual, full_matrices=False)
+        sqrt_S   = S[:rank_q4].sqrt()
+        R_fp16   = (sqrt_S[:, None] * Vh[:rank_q4, :]).to(torch.float16)        # (128, K)
+        L_fp16   = (U[:, :rank_q4]  * sqrt_S[None, :]).to(torch.float16)        # (N, 128)
+        R_fp4, R_scale_fp4 = dynamic_mxfp4_quant(R_fp16)    # (128, K//2), (128, K//32)
+        L_fp4, L_scale_fp4 = dynamic_mxfp4_quant(L_fp16)    # (N, 64),    (N, 4)
+
+        w_fp4_t     = v1_layer.weight_fp4.t().contiguous()
+        w_fp4_t_svd = loraq_layer.weight_fp4.t().contiguous()
+
+        # ---- SVDQ autotuned ----
+        P, a_fp4_svd, a_sq_svd = at_pq(x, loraq_layer.R, loraq_layer.channel_scale)
+        _ = at_dg(P, loraq_layer.L, a_fp4_svd, a_sq_svd,
+                  w_fp4_t_svd, loraq_layer.weight_scale, M, N, K)
+
+        def svdq_e2e():
+            P_, a_, s_ = at_pq(x, loraq_layer.R, loraq_layer.channel_scale)
+            at_dg(P_, loraq_layer.L, a_, s_,
+                  w_fp4_t_svd, loraq_layer.weight_scale, M, N, K)
+
+        t_svd_ms = tt.do_bench(svdq_e2e, warmup=WARMUP, rep=ITERS)
+
+        # ---- K7 autotuned ----
+        _ = at_k7(a_fp8, a_scale_fp8,
+                  v1_layer.R_fp8, v1_layer.R_scale,
+                  v1_layer.L_fp8, v1_layer.L_scale,
+                  w_fp4_t, v1_layer.weight_scale, M, N, K)
+        t_k7_ms = tt.do_bench(
+            lambda: at_k7(a_fp8, a_scale_fp8,
+                          v1_layer.R_fp8, v1_layer.R_scale,
+                          v1_layer.L_fp8, v1_layer.L_scale,
+                          w_fp4_t, v1_layer.weight_scale, M, N, K),
+            warmup=WARMUP, rep=ITERS,
+        )
+
+        # ---- K13 autotuned (MXFP8 A, MXFP4 R/L/W, MXFP8 out) ----
+        _ = at_k13(a_fp8, a_scale_fp8,
+                   R_fp4, R_scale_fp4,
+                   L_fp4, L_scale_fp4,
+                   w_fp4_t, v1_layer.weight_scale, M, N, K)
+        t_k13_ms = tt.do_bench(
+            lambda: at_k13(a_fp8, a_scale_fp8,
+                           R_fp4, R_scale_fp4,
+                           L_fp4, L_scale_fp4,
+                           w_fp4_t, v1_layer.weight_scale, M, N, K),
+            warmup=WARMUP, rep=ITERS,
+        )
+
+        # ---- K14 autotuned (MXFP8 A, MXFP4 R/L/W, FP16 out) ----
+        _ = at_k14(a_fp8, a_scale_fp8,
+                   R_fp4, R_scale_fp4,
+                   L_fp4, L_scale_fp4,
+                   w_fp4_t, v1_layer.weight_scale, M, N, K)
+        t_k14_ms = tt.do_bench(
+            lambda: at_k14(a_fp8, a_scale_fp8,
+                           R_fp4, R_scale_fp4,
+                           L_fp4, L_scale_fp4,
+                           w_fp4_t, v1_layer.weight_scale, M, N, K),
+            warmup=WARMUP, rep=ITERS,
+        )
+
+        t_svd = t_svd_ms  / 1000.0
+        t_k7  = t_k7_ms   / 1000.0
+        t_k13 = t_k13_ms  / 1000.0
+        t_k14 = t_k14_ms  / 1000.0
+
+        tf_svd = tflops(M, N, K, t_svd)
+        tf_k7  = tflops(M, N, K, t_k7)
+        tf_k13 = tflops(M, N, K, t_k13)
+        tf_k14 = tflops(M, N, K, t_k14)
+
+        k7_over_svd  = t_svd / t_k7  if t_k7  > 0 else float("inf")
+        k13_over_svd = t_svd / t_k13 if t_k13 > 0 else float("inf")
+        k14_over_svd = t_svd / t_k14 if t_k14 > 0 else float("inf")
+        k13_over_k7  = t_k7  / t_k13 if t_k13 > 0 else float("inf")
+        k14_over_k7  = t_k7  / t_k14 if t_k14 > 0 else float("inf")
+
+        print(
+            f"{M:>6} {K:>6} {N:>6}  "
+            f"{us(t_svd):>9.1f}µ {tf_svd:>7.2f}  "
+            f"{us(t_k7):>8.1f}µ {tf_k7:>6.2f}  "
+            f"{us(t_k13):>8.1f}µ {tf_k13:>6.2f}  "
+            f"{us(t_k14):>8.1f}µ {tf_k14:>6.2f}  "
+            f"{k7_over_svd:>6.2f}x {k13_over_svd:>7.2f}x {k14_over_svd:>7.2f}x "
+            f"{k13_over_k7:>6.2f}x {k14_over_k7:>6.2f}x"
+        )
+        rows.append({
+            "M": M, "K": K, "N": N,
+            "svdq_us": round(us(t_svd),  1), "svdq_tflops": round(tf_svd,  3),
+            "k7_us":   round(us(t_k7),   1), "k7_tflops":   round(tf_k7,   3),
+            "k13_us":  round(us(t_k13),  1), "k13_tflops":  round(tf_k13,  3),
+            "k14_us":  round(us(t_k14),  1), "k14_tflops":  round(tf_k14,  3),
+            "k7_over_svdq":  round(k7_over_svd,  3),
+            "k13_over_svdq": round(k13_over_svd, 3),
+            "k14_over_svdq": round(k14_over_svd, 3),
+            "k13_over_k7":   round(k13_over_k7,  3),
+            "k14_over_k7":   round(k14_over_k7,  3),
+        })
+
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Pixart-σ transformer block benchmark
 # ---------------------------------------------------------------------------
 
@@ -1188,6 +1353,8 @@ def main():
     parser.add_argument("--autotuned-only",  action="store_true", help="Run autotuned vs fixed-config comparison")
     parser.add_argument("--v1-vs-loraq-wallclock", action="store_true", help="LoRaQ.1 vs SVDQ with wall-clock benchmark_fn")
     parser.add_argument("--loraq3-only",  action="store_true", help="LoRaQ.3 (fp16io) vs LoRaQ.1 comparison")
+    parser.add_argument("--v1-vs-q4-vs-svdq", action="store_true",
+                        help="K7 (FP8) vs K13 (FP4) vs SVDQ — three-way autotuned comparison")
     parser.add_argument("--svdq-vs-loraq-pixarts-tblock", action="store_true",
                         help="SVDQ vs LoRaQ-Mixed end-to-end Pixart-σ transformer block")
     parser.add_argument("--loraq-fp16lr", action="store_true", help="LoRaQ.6 (fp16 L,R) vs LoRaQ.1 comparison")
@@ -1201,6 +1368,7 @@ def main():
         or args.v1_vs_loraq_tuned or args.autotuned_only
         or args.v1_vs_loraq_wallclock
         or args.loraq3_only
+        or args.v1_vs_q4_vs_svdq
         or args.svdq_vs_loraq_pixarts_tblock
         or args.loraq_fp16lr
     )
@@ -1231,6 +1399,9 @@ def main():
 
     if args.loraq3_only:
         results["loraq3"] = bench_loraq3(SIZES)
+
+    if run_all or args.v1_vs_q4_vs_svdq:
+        results["v1_vs_q4_vs_svdq"] = bench_v1_vs_q4_vs_svdq(SIZES)
 
     if run_all or args.svdq_vs_loraq_pixarts_tblock:
         results["svdq_vs_loraq_pixarts_tblock"] = bench_svdq_vs_loraq_pixarts_tblock()
