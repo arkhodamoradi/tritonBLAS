@@ -59,6 +59,15 @@ _BASE_CONFIGS = [
     # ---- num_warps=4 ----
     (128, 128, 64, 4, 4, 2),
     (128, 256, 64, 4, 4, 2),
+    # ---- Small BLOCK_M for rank-128 kernels (lower register pressure) ----
+    (64, 128, 128, 4, 4, 2),
+    (64, 128, 128, 8, 4, 2),
+    (64, 64, 64, 4, 4, 2),
+    (64, 64, 128, 4, 4, 2),
+    (32, 128, 64, 4, 4, 2),
+    (32, 128, 128, 4, 4, 2),
+    (32, 256, 64, 4, 4, 2),
+    (32, 256, 128, 4, 4, 2),
 ]
 
 # Expand with waves_per_eu sweep (0 = driver default, 1-4 = explicit)
@@ -1028,6 +1037,242 @@ class AutotunedLoRaQ4_16:
 
     def get_best_config(self, M, N, K):
         return self._cache.get((M, N, K))
+
+
+# ---------------------------------------------------------------------------
+# Runtime autotuner for K13_2 (RL-restructured, FP16 L, MXFP8 output)
+# ---------------------------------------------------------------------------
+
+class AutotunedLoRaQ4_2:
+    """
+    Runtime autotuner for ``loraq_fused_q4_kernel_2`` (K13_2).
+
+    Activation (A) is MXFP8.  R and W are MXFP4.  L is FP16 (no scale).
+    Output is (c_fp8, c_scale) where c_fp8 is (M, N) uint8 (float8_e4m3fn).
+    """
+
+    def __init__(self, kernel_fn, configs=None, rank=128,
+                 waves_per_eu_values=None, warmup=10, rep=50):
+        self.kernel_fn = kernel_fn
+        self.configs = configs or LORAQ_Q8_CONFIGS
+        self.rank = rank
+        self.waves_per_eu_values = waves_per_eu_values or [0, 1, 2]
+        self.warmup = warmup
+        self.rep = rep
+        self._cache: dict[tuple[int, int, int], dict] = {}
+
+    def _make_launch_fn(self, cfg, wpe, a_fp8, a_scale, r_fp4, r_scale,
+                        l_fp16, w_fp4_t, w_scale, bias_ptr,
+                        channel_scale, c_fp8, c_scale, M, N, K, has_bias):
+        bm, bn, bk, gm = cfg.kwargs["BLOCK_M"], cfg.kwargs["BLOCK_N"], cfg.kwargs["BLOCK_K"], cfg.kwargs["GROUP_SIZE_M"]
+        grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+
+        def launch():
+            self.kernel_fn[grid](
+                a_fp8, a_scale, r_fp4, r_scale,
+                l_fp16,
+                w_fp4_t, w_scale, bias_ptr, channel_scale,
+                c_fp8, c_scale,
+                M, N, K,
+                a_fp8.stride(0), a_fp8.stride(1),
+                a_scale.stride(0), a_scale.stride(1),
+                r_fp4.stride(0), r_fp4.stride(1),
+                r_scale.stride(0), r_scale.stride(1),
+                l_fp16.stride(0), l_fp16.stride(1),
+                w_fp4_t.stride(0), w_fp4_t.stride(1),
+                w_scale.stride(0), w_scale.stride(1),
+                c_fp8.stride(0), c_fp8.stride(1),
+                c_scale.stride(0), c_scale.stride(1),
+                channel_scale.stride(0),
+                HAS_BIAS=has_bias, RANK=self.rank,
+                BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_SIZE_M=gm,
+                num_warps=cfg.num_warps, num_stages=cfg.num_stages,
+                waves_per_eu=wpe, matrix_instr_nonkdim=32,
+            )
+        return launch
+
+    def _tune(self, a_fp8, a_scale, r_fp4, r_scale, l_fp16,
+              w_fp4_t, w_scale, M, N, K, bias, has_bias, channel_scale):
+        bias_ptr = bias if has_bias else a_fp8
+        c_fp8   = torch.empty((M, N), dtype=torch.uint8, device=a_fp8.device)
+        c_scale = torch.empty((M, N // 32), dtype=torch.uint8, device=a_fp8.device)
+        best_ms, best_cfg, best_wpe = float("inf"), None, 0
+        for cfg in self.configs:
+            if cfg.kwargs["BLOCK_K"] > K:
+                continue
+            for wpe in self.waves_per_eu_values:
+                try:
+                    fn = self._make_launch_fn(
+                        cfg, wpe, a_fp8, a_scale, r_fp4, r_scale,
+                        l_fp16, w_fp4_t, w_scale,
+                        bias_ptr, channel_scale, c_fp8, c_scale, M, N, K, has_bias,
+                    )
+                    ms = tt.do_bench(fn, warmup=self.warmup, rep=self.rep)
+                    if ms < best_ms:
+                        best_ms, best_cfg, best_wpe = ms, cfg, wpe
+                except Exception:
+                    continue
+        if best_cfg is None:
+            best_cfg = triton.Config(
+                {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+                num_warps=8, num_stages=2,
+            )
+        return {"config": best_cfg, "waves_per_eu": best_wpe, "time_ms": best_ms}
+
+    def __call__(self, a_fp8, a_scale, r_fp4, r_scale, l_fp16,
+                 w_fp4_t, w_scale, M, N, K, bias=None, channel_scale=None):
+        key = (M, N, K)
+        has_bias = bias is not None
+        bias_ptr = bias if has_bias else a_fp8
+        if channel_scale is None:
+            channel_scale = torch.ones(N, dtype=torch.float16, device=a_fp8.device)
+        if key not in self._cache:
+            self._cache[key] = self._tune(
+                a_fp8, a_scale, r_fp4, r_scale, l_fp16,
+                w_fp4_t, w_scale, M, N, K, bias, has_bias, channel_scale,
+            )
+        cfg = self._cache[key]["config"]
+        wpe = self._cache[key]["waves_per_eu"]
+        bm, bn, bk, gm = cfg.kwargs["BLOCK_M"], cfg.kwargs["BLOCK_N"], cfg.kwargs["BLOCK_K"], cfg.kwargs["GROUP_SIZE_M"]
+        c_fp8   = torch.empty((M, N), dtype=torch.uint8, device=a_fp8.device)
+        c_scale = torch.empty((M, N // 32), dtype=torch.uint8, device=a_fp8.device)
+        grid    = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+        self.kernel_fn[grid](
+            a_fp8, a_scale, r_fp4, r_scale,
+            l_fp16,
+            w_fp4_t, w_scale, bias_ptr, channel_scale,
+            c_fp8, c_scale,
+            M, N, K,
+            a_fp8.stride(0), a_fp8.stride(1),
+            a_scale.stride(0), a_scale.stride(1),
+            r_fp4.stride(0), r_fp4.stride(1),
+            r_scale.stride(0), r_scale.stride(1),
+            l_fp16.stride(0), l_fp16.stride(1),
+            w_fp4_t.stride(0), w_fp4_t.stride(1),
+            w_scale.stride(0), w_scale.stride(1),
+            c_fp8.stride(0), c_fp8.stride(1),
+            c_scale.stride(0), c_scale.stride(1),
+            channel_scale.stride(0),
+            HAS_BIAS=has_bias, RANK=self.rank,
+            BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_SIZE_M=gm,
+            num_warps=cfg.num_warps, num_stages=cfg.num_stages,
+            waves_per_eu=wpe, matrix_instr_nonkdim=32,
+        )
+        return c_fp8, c_scale
+
+
+# ---------------------------------------------------------------------------
+# Runtime autotuner for K14_2 (RL-restructured, FP16 L, FP16 output)
+# ---------------------------------------------------------------------------
+
+class AutotunedLoRaQ4_16_2:
+    """
+    Runtime autotuner for ``loraq_fused_q4_kernel_4_16_2`` (K14_2).
+
+    Activation (A) is MXFP8.  R and W are MXFP4.  L is FP16 (no scale).
+    Output is a single fp16 tensor C.
+    """
+
+    def __init__(self, kernel_fn, configs=None, rank=128,
+                 waves_per_eu_values=None, warmup=10, rep=50):
+        self.kernel_fn = kernel_fn
+        self.configs = configs or LORAQ_Q8_CONFIGS
+        self.rank = rank
+        self.waves_per_eu_values = waves_per_eu_values or [0, 1, 2]
+        self.warmup = warmup
+        self.rep = rep
+        self._cache: dict[tuple[int, int, int], dict] = {}
+
+    def _make_launch_fn(self, cfg, wpe, a_fp8, a_scale, r_fp4, r_scale,
+                        l_fp16, w_fp4_t, w_scale, bias_ptr,
+                        C, M, N, K, has_bias):
+        bm, bn, bk, gm = cfg.kwargs["BLOCK_M"], cfg.kwargs["BLOCK_N"], cfg.kwargs["BLOCK_K"], cfg.kwargs["GROUP_SIZE_M"]
+        grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+
+        def launch():
+            self.kernel_fn[grid](
+                a_fp8, a_scale, r_fp4, r_scale,
+                l_fp16,
+                w_fp4_t, w_scale, bias_ptr,
+                C,
+                M, N, K,
+                a_fp8.stride(0), a_fp8.stride(1),
+                a_scale.stride(0), a_scale.stride(1),
+                r_fp4.stride(0), r_fp4.stride(1),
+                r_scale.stride(0), r_scale.stride(1),
+                l_fp16.stride(0), l_fp16.stride(1),
+                w_fp4_t.stride(0), w_fp4_t.stride(1),
+                w_scale.stride(0), w_scale.stride(1),
+                C.stride(0), C.stride(1),
+                HAS_BIAS=has_bias, RANK=self.rank,
+                BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_SIZE_M=gm,
+                num_warps=cfg.num_warps, num_stages=cfg.num_stages,
+                waves_per_eu=wpe, matrix_instr_nonkdim=32,
+            )
+        return launch
+
+    def _tune(self, a_fp8, a_scale, r_fp4, r_scale, l_fp16,
+              w_fp4_t, w_scale, M, N, K, bias, has_bias):
+        bias_ptr = bias if has_bias else a_fp8
+        C = torch.empty((M, N), dtype=torch.float16, device=a_fp8.device)
+        best_ms, best_cfg, best_wpe = float("inf"), None, 0
+        for cfg in self.configs:
+            if cfg.kwargs["BLOCK_K"] > K:
+                continue
+            for wpe in self.waves_per_eu_values:
+                try:
+                    fn = self._make_launch_fn(
+                        cfg, wpe, a_fp8, a_scale, r_fp4, r_scale,
+                        l_fp16, w_fp4_t, w_scale,
+                        bias_ptr, C, M, N, K, has_bias,
+                    )
+                    ms = tt.do_bench(fn, warmup=self.warmup, rep=self.rep)
+                    if ms < best_ms:
+                        best_ms, best_cfg, best_wpe = ms, cfg, wpe
+                except Exception:
+                    continue
+        if best_cfg is None:
+            best_cfg = triton.Config(
+                {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+                num_warps=8, num_stages=2,
+            )
+        return {"config": best_cfg, "waves_per_eu": best_wpe, "time_ms": best_ms}
+
+    def __call__(self, a_fp8, a_scale, r_fp4, r_scale, l_fp16,
+                 w_fp4_t, w_scale, M, N, K, bias=None):
+        key = (M, N, K)
+        has_bias = bias is not None
+        bias_ptr = bias if has_bias else a_fp8
+        if key not in self._cache:
+            self._cache[key] = self._tune(
+                a_fp8, a_scale, r_fp4, r_scale, l_fp16,
+                w_fp4_t, w_scale, M, N, K, bias, has_bias,
+            )
+        cfg = self._cache[key]["config"]
+        wpe = self._cache[key]["waves_per_eu"]
+        bm, bn, bk, gm = cfg.kwargs["BLOCK_M"], cfg.kwargs["BLOCK_N"], cfg.kwargs["BLOCK_K"], cfg.kwargs["GROUP_SIZE_M"]
+        C    = torch.empty((M, N), dtype=torch.float16, device=a_fp8.device)
+        grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+        self.kernel_fn[grid](
+            a_fp8, a_scale, r_fp4, r_scale,
+            l_fp16,
+            w_fp4_t, w_scale, bias_ptr,
+            C,
+            M, N, K,
+            a_fp8.stride(0), a_fp8.stride(1),
+            a_scale.stride(0), a_scale.stride(1),
+            r_fp4.stride(0), r_fp4.stride(1),
+            r_scale.stride(0), r_scale.stride(1),
+            l_fp16.stride(0), l_fp16.stride(1),
+            w_fp4_t.stride(0), w_fp4_t.stride(1),
+            w_scale.stride(0), w_scale.stride(1),
+            C.stride(0), C.stride(1),
+            HAS_BIAS=has_bias, RANK=self.rank,
+            BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_SIZE_M=gm,
+            num_warps=cfg.num_warps, num_stages=cfg.num_stages,
+            waves_per_eu=wpe, matrix_instr_nonkdim=32,
+        )
+        return C
 
 
 # ---------------------------------------------------------------------------
